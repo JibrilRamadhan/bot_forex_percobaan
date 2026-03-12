@@ -6,9 +6,7 @@ yfinance>=0.2.40
 
 # === Analisa Teknikal ===
 pandas>=2.0.0
-# pandas-ta: install dari GitHub karena versi PyPI tidak support Python 3.11
-# (versi baru 0.4.x butuh Python >=3.12, versi lama 0.3.14b punya bug versi di pip)
-git+https://github.com/twopirllc/pandas-ta.git@development
+ta>=0.11.0
 numpy>=1.24.0
 
 # === Web Scraping / Berita ===

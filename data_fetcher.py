@@ -11,7 +11,7 @@ Modul ini bertanggung jawab untuk:
 import time
 import logging
 import pandas as pd
-import pandas_ta as ta
+import ta
 import yfinance as yf
 from typing import Optional
 
@@ -128,7 +128,7 @@ def fetch_info(kode_saham: str) -> dict:
 # ----------------------------------------------------------------
 def calculate_indicators(df: pd.DataFrame) -> Optional[pd.DataFrame]:
     """
-    Menghitung semua indikator teknikal yang dibutuhkan menggunakan pandas_ta.
+    Menghitung semua indikator teknikal yang dibutuhkan menggunakan library ta.
 
     Indikator yang dihitung:
         - EMA_5 & EMA_13 (Exponential Moving Average)
@@ -153,15 +153,25 @@ def calculate_indicators(df: pd.DataFrame) -> Optional[pd.DataFrame]:
         # Pastikan nama kolom standar (lowercase)
         df.columns = [col.lower() for col in df.columns]
 
-        # --- EMA Cepat & Lambat ---
-        df[f"EMA_{config.EMA_FAST}"] = ta.ema(df["close"], length=config.EMA_FAST)
-        df[f"EMA_{config.EMA_SLOW}"] = ta.ema(df["close"], length=config.EMA_SLOW)
+        close = df["close"]
+        volume = df["volume"]
 
-        # --- RSI ---
-        df[f"RSI_{config.RSI_PERIOD}"] = ta.rsi(df["close"], length=config.RSI_PERIOD)
+        # --- EMA Cepat & Lambat (menggunakan library ta) ---
+        df[f"EMA_{config.EMA_FAST}"] = ta.trend.EMAIndicator(
+            close=close, window=config.EMA_FAST, fillna=False
+        ).ema_indicator()
 
-        # --- Volume SMA ---
-        df[f"VOL_SMA_{config.VOLUME_SMA}"] = ta.sma(df["volume"], length=config.VOLUME_SMA)
+        df[f"EMA_{config.EMA_SLOW}"] = ta.trend.EMAIndicator(
+            close=close, window=config.EMA_SLOW, fillna=False
+        ).ema_indicator()
+
+        # --- RSI (menggunakan library ta) ---
+        df[f"RSI_{config.RSI_PERIOD}"] = ta.momentum.RSIIndicator(
+            close=close, window=config.RSI_PERIOD, fillna=False
+        ).rsi()
+
+        # --- Volume SMA (rolling mean via pandas — lebih ringan) ---
+        df[f"VOL_SMA_{config.VOLUME_SMA}"] = volume.rolling(window=config.VOLUME_SMA).mean()
 
         # Hapus baris dengan nilai NaN (akibat perhitungan rolling)
         df.dropna(inplace=True)
