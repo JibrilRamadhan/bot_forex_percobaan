@@ -1,11 +1,12 @@
 """
-data_fetcher.py - Pengambil Data & Kalkulasi Indikator Teknikal
-===============================================================
-Modul ini bertanggung jawab untuk:
-1. Mengambil data OHLCV (Open, High, Low, Close, Volume) dari yfinance.
-2. Menghitung semua indikator teknikal menggunakan pandas_ta.
-3. Mendeteksi kondisi sinyal (crossover, volume surge, RSI).
-4. Menghitung level Support & Resistance menggunakan Pivot Point Klasik.
+data_fetcher.py - Data & Indikator Teknikal (v2.0)
+====================================================
+Perubahan v2.0:
+- ATR-14 untuk Stop Loss dinamis
+- Bollinger Bands (20,2) + Squeeze detection
+- Multi-Timeframe: konfirmasi tren dari data Daily
+- Technical Scoring System (0-100)
+- Kalkulasi Stop Loss, Target Price, Risk/Reward otomatis
 """
 
 import time
@@ -13,6 +14,7 @@ import logging
 import pandas as pd
 import ta
 import yfinance as yf
+import numpy as np
 from typing import Optional
 
 import config
@@ -21,17 +23,9 @@ logger = logging.getLogger(__name__)
 
 
 # ----------------------------------------------------------------
-# FUNGSI UTILITAS
+# UTILITAS
 # ----------------------------------------------------------------
 def format_ticker(kode_saham: str) -> str:
-    """
-    Memastikan kode saham memiliki suffix '.JK' untuk pasar Indonesia.
-    
-    Contoh:
-        'INET'    -> 'INET.JK'
-        'INET.JK' -> 'INET.JK' (sudah benar, tidak berubah)
-        'inet'    -> 'INET.JK' (case-insensitive)
-    """
     kode_saham = kode_saham.strip().upper()
     if not kode_saham.endswith(".JK"):
         kode_saham = f"{kode_saham}.JK"
@@ -39,12 +33,11 @@ def format_ticker(kode_saham: str) -> str:
 
 
 def get_clean_code(ticker: str) -> str:
-    """Mengembalikan kode saham bersih tanpa suffix .JK (misal: 'INET.JK' -> 'INET')."""
     return ticker.replace(".JK", "").upper()
 
 
 # ----------------------------------------------------------------
-# PENGAMBILAN DATA DARI YFINANCE
+# FETCH DATA
 # ----------------------------------------------------------------
 def fetch_ohlcv(
     kode_saham: str,
@@ -52,276 +45,334 @@ def fetch_ohlcv(
     period: str = config.YFINANCE_PERIOD,
     max_retry: int = 3,
 ) -> Optional[pd.DataFrame]:
-    """
-    Mengambil data OHLCV dari yfinance dengan penanganan error dan retry.
-
-    Args:
-        kode_saham: Kode saham (dengan atau tanpa .JK).
-        interval: Interval candlestick, default '15m'.
-        period: Periode data, default '5d'.
-        max_retry: Jumlah percobaan ulang jika gagal.
-
-    Returns:
-        DataFrame pandas dengan data OHLCV, atau None jika gagal.
-    """
     ticker = format_ticker(kode_saham)
-
     for attempt in range(1, max_retry + 1):
         try:
-            logger.info(f"[FETCHER] Mengambil data {ticker} (percobaan {attempt}/{max_retry})")
-            df = yf.download(
-                ticker,
-                interval=interval,
-                period=period,
-                progress=False,   # Nonaktifkan progress bar
-                auto_adjust=True, # Sesuaikan harga untuk dividen/split
-            )
-
-            # Periksa apakah DataFrame kosong
+            logger.info(f"[FETCHER] Mengambil data {ticker} interval={interval} (percobaan {attempt})")
+            df = yf.download(ticker, interval=interval, period=period,
+                             progress=False, auto_adjust=True)
             if df is None or df.empty:
-                logger.warning(f"[FETCHER] Data kosong untuk {ticker} pada percobaan {attempt}")
                 if attempt < max_retry:
-                    time.sleep(2 ** attempt)  # Exponential backoff
+                    time.sleep(2 ** attempt)
                 continue
-
-            # Flatten MultiIndex columns jika ada (yfinance kadang menghasilkan ini)
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = df.columns.get_level_values(0)
-
-            logger.info(f"[FETCHER] ✅ Berhasil mengambil {len(df)} candle untuk {ticker}")
+            logger.info(f"[FETCHER] ✅ {len(df)} candle untuk {ticker}")
             return df
-
         except Exception as e:
-            logger.error(f"[FETCHER] Error pada percobaan {attempt} untuk {ticker}: {e}")
+            logger.error(f"[FETCHER] Error percobaan {attempt}: {e}")
             if attempt < max_retry:
                 time.sleep(2 ** attempt)
-
-    logger.error(f"[FETCHER] ❌ Gagal mengambil data untuk {ticker} setelah {max_retry} percobaan")
     return None
 
 
+def fetch_daily(kode_saham: str) -> Optional[pd.DataFrame]:
+    """Ambil data harian (60 hari) untuk multi-timeframe analysis."""
+    return fetch_ohlcv(kode_saham, interval="1d", period="60d")
+
+
 def fetch_info(kode_saham: str) -> dict:
-    """
-    Mengambil informasi umum saham (nama perusahaan, sektor, dll.).
-    
-    Returns:
-        Dictionary berisi info saham, atau dict kosong jika gagal.
-    """
     ticker = format_ticker(kode_saham)
     try:
-        stock = yf.Ticker(ticker)
-        info = stock.info
+        info = yf.Ticker(ticker).info
         return {
             "nama_perusahaan": info.get("longName", get_clean_code(ticker)),
             "sektor": info.get("sector", "N/A"),
-            "industri": info.get("industry", "N/A"),
-            "market_cap": info.get("marketCap", 0),
-            "currency": info.get("currency", "IDR"),
         }
-    except Exception as e:
-        logger.warning(f"[FETCHER] Gagal mengambil info untuk {ticker}: {e}")
+    except Exception:
         return {"nama_perusahaan": get_clean_code(ticker), "sektor": "N/A"}
 
 
 # ----------------------------------------------------------------
-# KALKULASI INDIKATOR TEKNIKAL
+# KALKULASI INDIKATOR (15 MENIT)
 # ----------------------------------------------------------------
 def calculate_indicators(df: pd.DataFrame) -> Optional[pd.DataFrame]:
     """
-    Menghitung semua indikator teknikal yang dibutuhkan menggunakan library ta.
-
-    Indikator yang dihitung:
-        - EMA_5 & EMA_13 (Exponential Moving Average)
-        - RSI_14 (Relative Strength Index)
-        - SMA_Volume_20 (Simple Moving Average volume)
-
-    Args:
-        df: DataFrame OHLCV dari yfinance.
-
-    Returns:
-        DataFrame yang sudah ditambahkan kolom indikator, atau None jika gagal.
+    Hitung semua indikator teknikal pada data 15 menit:
+    EMA5, EMA13, RSI14, Volume SMA20, ATR14, Bollinger Bands(20,2)
     """
     try:
-        # Pastikan cukup data untuk kalkulasi
-        min_rows_needed = max(config.EMA_SLOW, config.RSI_PERIOD, config.VOLUME_SMA) * 2
-        if len(df) < min_rows_needed:
-            logger.warning(f"[INDICATOR] Data tidak cukup: {len(df)} baris (butuh minimal {min_rows_needed})")
+        min_rows = max(config.EMA_SLOW, config.RSI_PERIOD, config.VOLUME_SMA, 20) * 2
+        if len(df) < min_rows:
+            logger.warning(f"[INDICATOR] Data tidak cukup: {len(df)} baris")
             return None
 
         df = df.copy()
-
-        # Pastikan nama kolom standar (lowercase)
-        df.columns = [col.lower() for col in df.columns]
-
+        df.columns = [c.lower() for c in df.columns]
         close = df["close"]
-        volume = df["volume"]
+        high = df["high"]
+        low = df["low"]
+        vol = df["volume"]
 
-        # --- EMA Cepat & Lambat (menggunakan library ta) ---
-        df[f"EMA_{config.EMA_FAST}"] = ta.trend.EMAIndicator(
-            close=close, window=config.EMA_FAST, fillna=False
-        ).ema_indicator()
+        # --- EMA ---
+        df[f"EMA_{config.EMA_FAST}"] = ta.trend.EMAIndicator(close, config.EMA_FAST, fillna=False).ema_indicator()
+        df[f"EMA_{config.EMA_SLOW}"] = ta.trend.EMAIndicator(close, config.EMA_SLOW, fillna=False).ema_indicator()
 
-        df[f"EMA_{config.EMA_SLOW}"] = ta.trend.EMAIndicator(
-            close=close, window=config.EMA_SLOW, fillna=False
-        ).ema_indicator()
+        # --- RSI ---
+        df[f"RSI_{config.RSI_PERIOD}"] = ta.momentum.RSIIndicator(close, config.RSI_PERIOD, fillna=False).rsi()
 
-        # --- RSI (menggunakan library ta) ---
-        df[f"RSI_{config.RSI_PERIOD}"] = ta.momentum.RSIIndicator(
-            close=close, window=config.RSI_PERIOD, fillna=False
-        ).rsi()
+        # --- Volume SMA ---
+        df[f"VOL_SMA_{config.VOLUME_SMA}"] = vol.rolling(config.VOLUME_SMA).mean()
 
-        # --- Volume SMA (rolling mean via pandas — lebih ringan) ---
-        df[f"VOL_SMA_{config.VOLUME_SMA}"] = volume.rolling(window=config.VOLUME_SMA).mean()
+        # --- ATR-14 (untuk Stop Loss) ---
+        df["ATR_14"] = ta.volatility.AverageTrueRange(
+            high=high, low=low, close=close, window=14, fillna=False
+        ).average_true_range()
 
-        # Hapus baris dengan nilai NaN (akibat perhitungan rolling)
+        # --- Bollinger Bands (20, 2) ---
+        bb = ta.volatility.BollingerBands(close=close, window=20, window_dev=2, fillna=False)
+        df["BB_upper"] = bb.bollinger_hband()
+        df["BB_lower"] = bb.bollinger_lband()
+        df["BB_mid"] = bb.bollinger_mavg()
+        df["BB_width"] = (df["BB_upper"] - df["BB_lower"]) / df["BB_mid"]
+
         df.dropna(inplace=True)
-
         if df.empty:
-            logger.warning("[INDICATOR] DataFrame kosong setelah dropna()")
             return None
 
-        logger.info(f"[INDICATOR] ✅ Indikator berhasil dihitung, {len(df)} candle valid.")
+        logger.info(f"[INDICATOR] ✅ {len(df)} candle valid dengan semua indikator")
         return df
 
     except Exception as e:
-        logger.error(f"[INDICATOR] Error saat kalkulasi indikator: {e}")
+        logger.error(f"[INDICATOR] Error: {e}")
         return None
 
 
 # ----------------------------------------------------------------
-# DETEKSI SINYAL TEKNIKAL
+# MULTI-TIMEFRAME: CEK TREN DAILY
+# ----------------------------------------------------------------
+def get_daily_trend(kode_saham: str) -> dict:
+    """
+    Ambil data harian dan hitung EMA-20 Daily.
+    Return: apakah harga saat ini berada di atas EMA-20 Daily (uptrend).
+    """
+    df_daily = fetch_daily(kode_saham)
+    default = {"uptrend_daily": False, "harga_vs_ema20d": 0.0, "ema20_daily": 0.0}
+
+    if df_daily is None or df_daily.empty or len(df_daily) < 25:
+        return default
+
+    try:
+        if isinstance(df_daily.columns, pd.MultiIndex):
+            df_daily.columns = df_daily.columns.get_level_values(0)
+        df_daily.columns = [c.lower() for c in df_daily.columns]
+
+        close_daily = df_daily["close"]
+        ema20d = ta.trend.EMAIndicator(close_daily, window=20, fillna=False).ema_indicator().dropna()
+
+        if ema20d.empty:
+            return default
+
+        harga_terakhir = float(close_daily.iloc[-1])
+        nilai_ema20d = float(ema20d.iloc[-1])
+        uptrend = harga_terakhir > nilai_ema20d
+        selisih_pct = ((harga_terakhir - nilai_ema20d) / nilai_ema20d) * 100
+
+        logger.info(f"[MTF] Daily trend: harga={harga_terakhir:,.0f} EMA20d={nilai_ema20d:,.0f} uptrend={uptrend}")
+        return {
+            "uptrend_daily": uptrend,
+            "harga_vs_ema20d": round(selisih_pct, 2),
+            "ema20_daily": round(nilai_ema20d, 2),
+        }
+
+    except Exception as e:
+        logger.warning(f"[MTF] Error daily trend: {e}")
+        return default
+
+
+# ----------------------------------------------------------------
+# DETEKSI SINYAL
 # ----------------------------------------------------------------
 def detect_signal(df: pd.DataFrame) -> dict:
-    """
-    Mendeteksi kondisi sinyal beli (HAKA/Bullish Crossover) pada candle terakhir.
-
-    Kondisi SEMUANYA harus terpenuhi untuk sinyal VALID:
-        1. EMA_5 crossover ke atas EMA_13 (candle sebelumnya EMA_5 < EMA_13,
-           candle terbaru EMA_5 > EMA_13).
-        2. Volume candle terakhir > (SMA_Volume_20 × 2.0).
-        3. RSI_14 < 70 (belum overbought).
-
-    Returns:
-        Dictionary berisi status sinyal dan detail setiap kondisi.
-    """
-    col_ema_fast = f"EMA_{config.EMA_FAST}"
-    col_ema_slow = f"EMA_{config.EMA_SLOW}"
+    """Deteksi semua kondisi sinyal dari candle terakhir."""
+    col_ef = f"EMA_{config.EMA_FAST}"
+    col_es = f"EMA_{config.EMA_SLOW}"
     col_rsi = f"RSI_{config.RSI_PERIOD}"
-    col_vol_sma = f"VOL_SMA_{config.VOLUME_SMA}"
+    col_vsma = f"VOL_SMA_{config.VOLUME_SMA}"
 
-    # Ambil 2 candle terakhir untuk deteksi crossover
-    row_prev = df.iloc[-2]  # Candle sebelumnya
-    row_last = df.iloc[-1]  # Candle terakhir (terkini)
+    row_prev = df.iloc[-2]
+    row_last = df.iloc[-1]
 
-    # --- Kondisi 1: EMA Crossover ---
-    ema_was_below = row_prev[col_ema_fast] < row_prev[col_ema_slow]
-    ema_now_above = row_last[col_ema_fast] > row_last[col_ema_slow]
+    # EMA Crossover
+    ema_was_below = row_prev[col_ef] < row_prev[col_es]
+    ema_now_above = row_last[col_ef] > row_last[col_es]
     is_crossover = ema_was_below and ema_now_above
+    ema_bullish = row_last[col_ef] > row_last[col_es]  # EMA fast masih di atas
 
-    # --- Kondisi 2: Volume Surge ---
-    vol_current = row_last["volume"]
-    vol_sma = row_last[col_vol_sma]
+    # Volume
+    vol_current = float(row_last["volume"])
+    vol_sma = float(row_last[col_vsma]) if col_vsma in df.columns else 1
     vol_ratio = vol_current / vol_sma if vol_sma > 0 else 0
-    is_volume_surge = vol_ratio >= config.VOLUME_SURGE_MULTIPLIER
+    is_vol_surge = vol_ratio >= config.VOLUME_SURGE_MULTIPLIER
 
-    # --- Kondisi 3: RSI Aman (tidak overbought) ---
-    rsi_value = row_last[col_rsi]
-    is_rsi_safe = rsi_value < config.RSI_OVERBOUGHT
+    # RSI
+    rsi_val = float(row_last[col_rsi])
+    is_rsi_safe = rsi_val < config.RSI_OVERBOUGHT
 
-    # --- Sinyal Valid Hanya Jika Semua Kondisi Terpenuhi ---
-    is_valid_signal = is_crossover and is_volume_surge and is_rsi_safe
+    # Bollinger Bands Squeeze + Breakout
+    bb_squeeze = False
+    bb_breakout = False
+    bb_width_now = float(row_last.get("BB_width", 0))
+    bb_upper = float(row_last.get("BB_upper", 0))
+    close_now = float(row_last["close"])
+
+    if "BB_width" in df.columns and len(df) >= 20:
+        bb_width_hist = df["BB_width"].tail(20)
+        bb_percentile_20 = float(bb_width_hist.quantile(0.25))
+        bb_squeeze = bb_width_now < bb_percentile_20
+        bb_breakout = (close_now > bb_upper) and is_vol_surge and bb_squeeze
+
+    # Sinyal utama valid jika SEMUA 3 kondisi dasar terpenuhi
+    is_valid = is_crossover and is_vol_surge and is_rsi_safe
 
     return {
-        "sinyal_valid": is_valid_signal,
-        "harga_terakhir": round(float(row_last["close"]), 2),
+        "sinyal_valid": is_valid,
+        "harga_terakhir": round(close_now, 2),
         "kondisi": {
             "crossover": {
                 "status": is_crossover,
-                "ema_fast_sebelum": round(float(row_prev[col_ema_fast]), 2),
-                "ema_slow_sebelum": round(float(row_prev[col_ema_slow]), 2),
-                "ema_fast_sekarang": round(float(row_last[col_ema_fast]), 2),
-                "ema_slow_sekarang": round(float(row_last[col_ema_slow]), 2),
+                "ema_bullish": ema_bullish,
+                "ema_fast_sebelum": round(float(row_prev[col_ef]), 2),
+                "ema_slow_sebelum": round(float(row_prev[col_es]), 2),
+                "ema_fast_sekarang": round(float(row_last[col_ef]), 2),
+                "ema_slow_sekarang": round(float(row_last[col_es]), 2),
             },
             "volume": {
-                "status": is_volume_surge,
+                "status": is_vol_surge,
                 "volume_sekarang": int(vol_current),
                 "volume_sma": round(float(vol_sma), 0),
                 "rasio": round(vol_ratio, 2),
-                "threshold": config.VOLUME_SURGE_MULTIPLIER,
             },
             "rsi": {
                 "status": is_rsi_safe,
-                "nilai": round(float(rsi_value), 2),
+                "nilai": round(rsi_val, 2),
                 "batas_overbought": config.RSI_OVERBOUGHT,
+            },
+            "bollinger": {
+                "squeeze": bb_squeeze,
+                "breakout": bb_breakout,
+                "bb_width": round(bb_width_now, 4),
+                "bb_upper": round(bb_upper, 2),
             },
         },
     }
 
 
 # ----------------------------------------------------------------
-# PERHITUNGAN SUPPORT & RESISTANCE (PIVOT POINT KLASIK)
+# ATR STOP LOSS & TARGET
 # ----------------------------------------------------------------
-def calculate_pivot_points(df: pd.DataFrame) -> dict:
+def calculate_risk_management(df: pd.DataFrame, harga: float) -> dict:
     """
-    Menghitung Support dan Resistance menggunakan metode Pivot Point Klasik.
-    PP = (H+L+C)/3 | R1=(2×PP)-L | R2=PP+(H-L) | S1=(2×PP)-H | S2=PP-(H-L)
+    Hitung Stop Loss dinamis berdasarkan ATR dan Target Price.
+    Stop Loss = harga - (1.5 × ATR)
+    Target    = harga + (2.0 × ATR)  → Risk/Reward minimal 1:1.3
     """
     try:
-        df_work = df.copy()
-
-        # Pastikan index adalah DatetimeIndex untuk resample
-        if not isinstance(df_work.index, pd.DatetimeIndex):
-            df_work = df_work.set_index(pd.to_datetime(df_work.index))
-
-        # Konversi ke daily untuk pivot point yang lebih akurat
-        df_daily = df_work.resample("D").agg(
-            {"high": "max", "low": "min", "close": "last"}
-        ).dropna()
-
-        # Butuh minimal 2 hari data untuk pivot hari sebelumnya
-        if len(df_daily) >= 2:
-            prev = df_daily.iloc[-2]
-        else:
-            # Fallback: gunakan candle terakhir dari data 15m
-            prev = df_work.iloc[-2]
-
-        high = float(prev["high"])
-        low = float(prev["low"])
-        close = float(prev["close"])
-
-        pp = (high + low + close) / 3
-        r1 = (2 * pp) - low
-        r2 = pp + (high - low)
-        s1 = (2 * pp) - high
-        s2 = pp - (high - low)
-
+        atr = float(df["ATR_14"].iloc[-1])
+        stop_loss = harga - (1.5 * atr)
+        target = harga + (2.0 * atr)
+        risiko = harga - stop_loss
+        potensi = target - harga
+        rr = round(potensi / risiko, 2) if risiko > 0 else 0
         return {
-            "PP": round(pp, 2),
-            "R1": round(r1, 2),
-            "R2": round(r2, 2),
-            "S1": round(s1, 2),
-            "S2": round(s2, 2),
+            "atr": round(atr, 2),
+            "stop_loss": round(stop_loss, 2),
+            "target_price": round(target, 2),
+            "risiko_per_saham": round(risiko, 2),
+            "potensi_per_saham": round(potensi, 2),
+            "risk_reward": rr,
         }
     except Exception as e:
-        logger.warning(f"[PIVOT] Error kalkulasi pivot point: {e}")
+        logger.warning(f"[RISK] Error kalkulasi risk management: {e}")
+        return {"atr": 0, "stop_loss": 0, "target_price": 0, "risiko_per_saham": 0, "potensi_per_saham": 0, "risk_reward": 0}
+
+
+# ----------------------------------------------------------------
+# TECHNICAL SCORING (0-100)
+# ----------------------------------------------------------------
+def calculate_technical_score(sinyal: dict, daily_trend: dict) -> int:
+    """
+    Sistem scoring teknikal 0-100 berdasarkan semua kondisi.
+    Digunakan untuk menentukan rekomendasi BUY / SELL / HOLD.
+    """
+    score = 0
+    k = sinyal["kondisi"]
+
+    # EMA Crossover (25 poin)
+    if k["crossover"]["status"]:
+        score += 25  # Crossover baru terjadi
+    elif k["crossover"]["ema_bullish"]:
+        score += 12  # EMA fast masih di atas (tren berlanjut)
+
+    # Volume (20 poin)
+    vol_rasio = k["volume"]["rasio"]
+    if vol_rasio >= 3.0:
+        score += 20
+    elif vol_rasio >= 2.0:
+        score += 15
+    elif vol_rasio >= 1.2:
+        score += 8
+
+    # RSI (20 poin)
+    rsi = k["rsi"]["nilai"]
+    if 40 <= rsi <= 60:
+        score += 20   # RSI zona netral terbaik
+    elif 30 <= rsi < 40:
+        score += 15   # Mendekati oversold, peluang rebound
+    elif 60 < rsi <= 70:
+        score += 10   # Masih aman tapi mulai panas
+    elif rsi < 30:
+        score += 18   # Oversold kuat, potensi reversal
+
+    # Bollinger Bands Breakout (20 poin)
+    if k["bollinger"]["breakout"]:
+        score += 20   # Breakout dari squeeze = sinyal A++
+    elif k["bollinger"]["squeeze"]:
+        score += 10   # Squeeze saja = energi terkumpul, siap meledak
+
+    # Multi-Timeframe Konfirmasi Daily (15 poin)
+    if daily_trend["uptrend_daily"]:
+        score += 15   # Tren utama naik = sinyal lebih valid
+
+    return min(score, 100)
+
+
+# ----------------------------------------------------------------
+# PIVOT POINT
+# ----------------------------------------------------------------
+def calculate_pivot_points(df: pd.DataFrame) -> dict:
+    try:
+        df_work = df.copy()
+        if not isinstance(df_work.index, pd.DatetimeIndex):
+            df_work = df_work.set_index(pd.to_datetime(df_work.index))
+        df_daily = df_work.resample("D").agg({"high": "max", "low": "min", "close": "last"}).dropna()
+        prev = df_daily.iloc[-2] if len(df_daily) >= 2 else df_work.iloc[-2]
+        h, l, c = float(prev["high"]), float(prev["low"]), float(prev["close"])
+        pp = (h + l + c) / 3
+        return {
+            "PP": round(pp, 2),
+            "R1": round((2 * pp) - l, 2),
+            "R2": round(pp + (h - l), 2),
+            "S1": round((2 * pp) - h, 2),
+            "S2": round(pp - (h - l), 2),
+        }
+    except Exception as e:
+        logger.warning(f"[PIVOT] Error: {e}")
         return {"PP": 0, "R1": 0, "R2": 0, "S1": 0, "S2": 0}
 
 
 # ----------------------------------------------------------------
-# FUNGSI LENGKAP: SCREENING SAHAM (dipakai oleh command /screening)
+# FULL SCREENING (main function)
 # ----------------------------------------------------------------
 def full_screening(kode_saham: str) -> Optional[dict]:
     """
-    Fungsi screening lengkap untuk satu saham.
-    Menggabungkan fetch data, kalkulasi indikator, deteksi sinyal, dan pivot.
-    
-    Returns:
-        Dictionary berisi semua data screening, atau None jika gagal.
+    Screening lengkap v2.0:
+    Data 15m + Daily + semua indikator + risk management + scoring
     """
     ticker = format_ticker(kode_saham)
     kode_bersih = get_clean_code(kode_saham)
 
-    # 1. Ambil data OHLCV
+    # 1. Data 15 menit
     df = fetch_ohlcv(ticker)
     if df is None:
         return None
@@ -333,35 +384,50 @@ def full_screening(kode_saham: str) -> Optional[dict]:
 
     # 3. Deteksi sinyal
     sinyal = detect_signal(df)
+    harga = sinyal["harga_terakhir"]
 
-    # 4. Hitung pivot point
+    # 4. Multi-Timeframe (daily trend)
+    daily_trend = get_daily_trend(ticker)
+
+    # 5. Risk Management (ATR-based)
+    risk = calculate_risk_management(df, harga)
+
+    # 6. Pivot Points
     pivots = calculate_pivot_points(df)
 
-    # 5. Hitung perubahan harga (%) dibanding candle sebelumnya
-    harga_sekarang = float(df.iloc[-1]["close"])
-    harga_kemarin = float(df.iloc[-2]["close"])
-    perubahan_pct = ((harga_sekarang - harga_kemarin) / harga_kemarin) * 100
+    # 7. Technical Score
+    tech_score = calculate_technical_score(sinyal, daily_trend)
 
-    # 6. Ambil info perusahaan
+    # 8. Perubahan harga vs candle sebelumnya
+    harga_prev = float(df.iloc[-2]["close"])
+    perubahan_pct = ((harga - harga_prev) / harga_prev) * 100
+
+    # 9. Info perusahaan
     info = fetch_info(ticker)
 
     return {
         "ticker": ticker,
         "kode": kode_bersih,
         "nama_perusahaan": info.get("nama_perusahaan", kode_bersih),
-        "harga_terakhir": harga_sekarang,
+        "harga_terakhir": harga,
         "perubahan_pct": round(perubahan_pct, 2),
         "pivot_points": pivots,
-        **sinyal,  # Gabungkan semua data sinyal
+        "daily_trend": daily_trend,
+        "risk_management": risk,
+        "technical_score": tech_score,
+        "df": df,  # Dibutuhkan untuk generate chart
+        **sinyal,
     }
 
 
 if __name__ == "__main__":
-    # Test modul secara standalone
     logging.basicConfig(level=logging.INFO)
-    hasil = full_screening("INET")
+    hasil = full_screening("BBCA")
     if hasil:
-        print(f"Saham: {hasil['kode']}")
-        print(f"Harga: Rp {hasil['harga_terakhir']:,.0f} ({hasil['perubahan_pct']:+.2f}%)")
-        print(f"Sinyal Valid: {hasil['sinyal_valid']}")
-        print(f"Pivot: {hasil['pivot_points']}")
+        print(f"Saham: {hasil['kode']} | Harga: Rp {hasil['harga_terakhir']:,.0f}")
+        print(f"Score Teknikal: {hasil['technical_score']}/100")
+        print(f"ATR Stop Loss: Rp {hasil['risk_management']['stop_loss']:,.0f}")
+        print(f"Target: Rp {hasil['risk_management']['target_price']:,.0f}")
+        print(f"Daily Uptrend: {hasil['daily_trend']['uptrend_daily']}")
+        print(f"BB Squeeze: {hasil['kondisi']['bollinger']['squeeze']}")
+        print(f"BB Breakout: {hasil['kondisi']['bollinger']['breakout']}")
