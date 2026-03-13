@@ -29,11 +29,10 @@ GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
 GROQ_MODEL: str = "llama-3.3-70b-versatile"
 
 # -------------------------------------------------------
-# WATCHLIST INTI (Radar 15 menit - quick scan)
+# WATCHLIST INTI (digunakan oleh Radar Otomatis 15 menit)
+# Sekarang menggunakan seluruh Kompas100 untuk jangkauan lebih luas
 # -------------------------------------------------------
-WATCHLIST: list[str] = [
-    "BBCA", "TLKM", "SIDO", "INET", "AMMN", "BREN",
-]
+WATCHLIST: list[str] = []  # Diisi setelah KOMPAS100 di-define (lihat bawah)
 
 # -------------------------------------------------------
 # KOMPAS100 - ~100 Saham Paling Liquid BEI (Mode Radar Sapu Bersih)
@@ -74,6 +73,9 @@ KOMPAS100: list[str] = [
 ]
 # Hapus duplikat
 KOMPAS100 = list(dict.fromkeys(KOMPAS100))
+
+# Radar otomatis menggunakan seluruh Kompas100
+WATCHLIST: list[str] = KOMPAS100
 
 # -------------------------------------------------------
 # KONFIGURASI ANALISA TEKNIKAL

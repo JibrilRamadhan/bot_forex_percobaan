@@ -457,23 +457,48 @@ Sinyal 15m valid HANYA jika trend harian juga naik
 
 
 async def cmd_watchlist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    wl = "\n".join(f"  {i+1}. <code>{k}</code>" for i, k in enumerate(config.WATCHLIST))
+    n = len(config.KOMPAS100)
+    # Tampilkan 20 saham pertama sebagai preview
+    preview = " | ".join(f"<code>{k}</code>" for k in config.KOMPAS100[:20])
     pesan = f"""
-{EMOJI['radar']} <b>WATCHLIST RADAR</b>
+{EMOJI['radar']} <b>WATCHLIST RADAR v3.0</b>
 ━━━━━━━━━━━━━━━━━━━━━━━━
-{wl}
 
+📡 Radar memantau <b>{n} saham</b> Kompas100 (paling liquid BEI)
+
+<b>Preview 20 saham pertama:</b>
+{preview}
+<i>... dan {n - 20} saham lainnya</i>
+
+━━━━━━━━━━━━━━━━━━━━━━━━
 {EMOJI['clock']} Interval: <b>{config.RADAR_INTERVAL_MINUTES} menit</b>
 {EMOJI['chart_up']} Jam aktif: <b>09:00 – 16:00 WIB</b>
+{EMOJI['lightning']} Filter: Crossover + Volume Surge + Daily Uptrend
+
+💡 <i>Gunakan /rekomendasi untuk top BUY hari ini</i>
 """.strip()
     await update.message.reply_text(pesan, parse_mode=ParseMode.HTML)
 
 
 async def cmd_screening(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # ── Jika tidak ada argumen → tampilkan pilihan saham populer ──
     if not context.args:
+        # Buat grid tombol dari 20 saham teratas Kompas100
+        saham_populer = config.KOMPAS100[:24]  # 24 saham = 6 baris × 4 kolom
+        tombol_rows = []
+        for i in range(0, len(saham_populer), 4):
+            row = [
+                InlineKeyboardButton(k, callback_data=f"screen_{k}")
+                for k in saham_populer[i:i+4]
+            ]
+            tombol_rows.append(row)
+
         await update.message.reply_text(
-            f"{EMOJI['warning']} Sertakan kode saham.\nContoh: <code>/screening INET</code>",
-            parse_mode=ParseMode.HTML)
+            f"{EMOJI['radar']} <b>Pilih saham untuk dianalisa:</b>\n"
+            f"<i>Atau ketik: /screening KODE (contoh: /screening INET)</i>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(tombol_rows),
+        )
         return
 
     kode_input = context.args[0].strip().upper().replace(".JK", "")
@@ -529,12 +554,16 @@ async def cmd_screening(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             pesan = build_screening_message(screening_data, sentiment_data, headlines)
 
             if chart_buf:
-                # Hapus pesan loading, kirim chart + analisa
-                await loading_msg.delete()
-                await update.message.reply_photo(
-                    photo=chart_buf,
-                    caption=pesan,
-                    parse_mode=ParseMode.HTML)
+                # Kirim chart dulu, BARU hapus loading msg jika berhasil
+                try:
+                    await update.message.reply_photo(
+                        photo=chart_buf,
+                        caption=pesan,
+                        parse_mode=ParseMode.HTML)
+                    await loading_msg.delete()
+                except Exception as photo_err:
+                    logger.warning(f"[BOT] Gagal kirim chart, fallback ke teks: {photo_err}")
+                    await loading_msg.edit_text(pesan, parse_mode=ParseMode.HTML)
             else:
                 await loading_msg.edit_text(pesan, parse_mode=ParseMode.HTML)
 
@@ -699,24 +728,43 @@ async def radar_scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     waktu = datetime.now(WIB).strftime("%H:%M WIB")
-    logger.info(f"[RADAR] 🔍 Scan {len(config.WATCHLIST)} saham — {waktu}")
-    sinyal = 0
+    n = len(config.WATCHLIST)
+    logger.info(f"[RADAR] 🔍 Scan {n} saham Kompas100 — {waktu}")
 
-    for kode in config.WATCHLIST:
+    # ── FASE 1: Bulk Download semua saham sekaligus (1 request) ──
+    from data_fetcher import bulk_fetch_ohlcv, quick_scan
+    data_map = await asyncio.get_event_loop().run_in_executor(
+        None, bulk_fetch_ohlcv, config.WATCHLIST)
+    logger.info(f"[RADAR] Bulk download selesai: {len(data_map)}/{n} saham")
+
+    # ── FASE 2: Quick scan — filter awal yang ringan ──
+    kandidat = []
+    for kode, df in data_map.items():
+        result = quick_scan(kode, df)
+        if result and result.get("sinyal_valid"):
+            kandidat.append(kode)
+
+    if not kandidat:
+        logger.info(f"[RADAR] Tidak ada sinyal dari {len(data_map)} saham.")
+        return
+
+    logger.info(f"[RADAR] {len(kandidat)} kandidat lolos quick scan → analisa mendalam...")
+
+    # ── FASE 3: Full screening hanya untuk kandidat (hemat RAM) ──
+    sinyal = 0
+    for kode in kandidat:
         try:
             data = await asyncio.get_event_loop().run_in_executor(None, full_screening, kode)
             if data is None:
                 continue
-            if not data.get("sinyal_valid", False):
-                continue
 
-            # Cek multi-timeframe: hanya alert jika tren harian mendukung
+            # Filter multi-timeframe: hanya alert jika daily uptrend
             if not data.get("daily_trend", {}).get("uptrend_daily", False):
-                logger.info(f"[RADAR] {kode}: Sinyal 15m ada, tapi Daily downtrend → skip")
+                logger.info(f"[RADAR] {kode}: daily downtrend → skip")
                 continue
 
-            logger.info(f"[RADAR] 🔔 Sinyal valid {kode}! Cek berita...")
-            headlines = await asyncio.get_event_loop().run_in_executor(None, get_news_for_stock, kode)
+            headlines = await asyncio.get_event_loop().run_in_executor(
+                None, get_news_for_stock, kode)
             tech_ctx = {
                 "technical_score": data.get("technical_score", 0),
                 "rsi": data["kondisi"]["rsi"]["nilai"],
@@ -728,14 +776,13 @@ async def radar_scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                 None, analyze_sentiment, kode, headlines, tech_ctx)
 
             if not is_signal_approved(sentiment):
-                logger.info(f"[RADAR] ⛔ {kode} difilter (sentimen Bearish)")
+                logger.info(f"[RADAR] ⛔ {kode} difilter sentimen Bearish")
                 continue
 
             pesan = build_signal_alert_message(data, sentiment)
-
-            # Kirim alert + chart
             chart_buf = await asyncio.get_event_loop().run_in_executor(
                 None, generate_chart, data["df"], kode, data)
+
             if chart_buf:
                 await context.bot.send_photo(
                     chat_id=config.TELEGRAM_CHAT_ID, photo=chart_buf,
@@ -751,7 +798,27 @@ async def radar_scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         except Exception as e:
             logger.error(f"[RADAR] Error {kode}: {e}")
 
-    logger.info(f"[RADAR] Selesai. {sinyal} sinyal dikirim dari {len(config.WATCHLIST)} saham.")
+    logger.info(f"[RADAR] Selesai. {sinyal} sinyal dari {n} saham.")
+
+
+# ----------------------------------------------------------------
+# ERROR HANDLER
+# ----------------------------------------------------------------
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle semua error Telegram secara terpusat."""
+    from telegram.error import Conflict, NetworkError, TimedOut
+    err = context.error
+
+    if isinstance(err, Conflict):
+        # Conflict = 2 instance bot jalan bersamaan — bukan crash, cukup log
+        logger.warning(
+            "[BOT] ⚠️ CONFLICT: Ada 2 instance bot berjalan bersamaan! "
+            "Pastikan TIDAK menjalankan 'python bot.py' di PC saat Railway aktif."
+        )
+    elif isinstance(err, (NetworkError, TimedOut)):
+        logger.warning(f"[BOT] Network error (akan retry otomatis): {err}")
+    else:
+        logger.error(f"[BOT] Unhandled error: {err}", exc_info=err)
 
 
 # ----------------------------------------------------------------
@@ -772,8 +839,8 @@ async def post_init(application: Application) -> None:
 
 def main() -> None:
     validate_config()
-    logger.info("[BOT] 🚀 IHSG Radar Bot & AI Screener v2.0 starting...")
-    logger.info(f"[BOT] Watchlist: {', '.join(config.WATCHLIST)}")
+    logger.info("[BOT] 🚀 IHSG Radar Bot & AI Screener v3.0 starting...")
+    logger.info(f"[BOT] Radar Kompas100: {len(config.WATCHLIST)} saham")
 
     application = (
         ApplicationBuilder()
@@ -781,6 +848,8 @@ def main() -> None:
         .post_init(post_init)
         .build()
     )
+
+    application.add_error_handler(error_handler)
 
     application.add_handler(CommandHandler("start", cmd_start))
     application.add_handler(CommandHandler("help", cmd_help))
