@@ -37,6 +37,7 @@ from config import validate_config, WIB
 from data_fetcher import (
     full_screening, format_ticker, get_clean_code,
     scan_kompas100_buy, scan_kompas100_danger,
+    get_market_leaders
 )
 from news_scraper import get_news_for_stock
 from ai_analyzer import analyze_sentiment, is_signal_approved, get_final_recommendation
@@ -258,14 +259,14 @@ def build_screening_message(screening_data: dict, sentiment_data: dict, headline
 {EMOJI['radar']} <b>SCREENING: {kode}</b> | <i>{nama}</i> | <i>by Jibril</i>
 ━━━━━━━━━━━━━━━━━━━━━━━━
 
-{EMOJI['money']} Harga: <code>Rp {harga:,.0f}</code> {perubahan_emoji} {perubahan_str} <i>by Jibril</i>
+{EMOJI['money']} Harga: <code>Rp {harga:,.0f}</code> {perubahan_emoji} {perubahan_str}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━
 {score_color} <b>TECHNICAL SCORE: {tech_score}/100</b>
-<code>[{score_bar}]</code> <i>by Jibril</i>
+<code>[{score_bar}]</code>
 
 ━━━━━━━━━━━━━━━━━━━━━━━━
-{EMOJI['chart']} <b>INDIKATOR TEKNIKAL</b> <i>by Jibril</i>
+{EMOJI['chart']} <b>INDIKATOR TEKNIKAL</b>
 ━━━━━━━━━━━━━━━━━━━━━━━━
 📉 {ema_status}
    └ EMA{config.EMA_FAST}: <code>{ema_fast:,.2f}</code> | EMA{config.EMA_SLOW}: <code>{ema_slow:,.2f}</code>
@@ -410,10 +411,13 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 🏁 Rekomendasi: STRONG BUY / BUY / HOLD / SELL
 
 ━━━━━━━━━━━━━━━━━━━━━━━━
-📋 <b>PERINTAH</b>
+📋 <b>PERINTAH UTAMA</b>
 ━━━━━━━━━━━━━━━━━━━━━━━━
-/screening [KODE] — Analisa + Chart saham
-/watchlist — Daftar saham radar
+/screening [KODE] — Analisa saham + Chart
+/market — Live Gainers, Volume, Value, Rebound
+/rekomendasi — Top BUY dari Kompas100
+/danger — Saham drop ekstrim hari ini
+/watchlist — Daftar pantauan radar
 /help — Panduan lengkap
 """.strip()
     await update.message.reply_text(pesan, parse_mode=ParseMode.HTML,
@@ -425,9 +429,11 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 {EMOJI['info']} <b>PANDUAN PENGGUNAAN v2.0</b>
 ━━━━━━━━━━━━━━━━━━━━━━━━
 
-{EMOJI['chart_up']} <b>Screening:</b>
-<code>/screening KODE</code> — misal: <code>/screening BBCA</code>
-Bot kirim analisa lengkap + chart PNG otomatis!
+{EMOJI['chart_up']} <b>Screening & Rekomendasi:</b>
+<code>/screening KODE</code> — Analisa AI & Chart
+<code>/market</code> — Top Gainers, Vol, Value & Rebound
+<code>/rekomendasi</code> — Sinyal BUY terbaik hr ini
+<code>/danger</code> — Hindari saham merah / drop
 
 ━━━━━━━━━━━━━━━━━━━━━━━━
 📊 <b>Technical Score 0-100:</b>
@@ -438,6 +444,7 @@ Bot kirim analisa lengkap + chart PNG otomatis!
 ━━━━━━━━━━━━━━━━━━━━━━━━
 🛡️ <b>ATR Stop Loss:</b>
 Stop loss dihitung otomatis: <code>Harga - (1.5 × ATR)</code>
+Target Price: <code>Harga + (2.0 × ATR)</code>
 Jangan hold di bawah stop loss!
 
 ━━━━━━━━━━━━━━━━━━━━━━━━
@@ -709,6 +716,92 @@ async def cmd_danger(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await msg.edit_text(f"{EMOJI['cross']} Error saat scan. Coba lagi.", parse_mode=ParseMode.HTML)
 
 
+# ----------------------------------------------------------------
+# /MARKET (v4.0)
+# ----------------------------------------------------------------
+async def cmd_market(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Tampilkan Ringkasan Top Gainer, Top Volume, Top Value, dan Live Rebound."""
+    await update.message.reply_chat_action("typing")
+    msg = await update.message.reply_text(
+        f"{EMOJI['radar']} Mengambil data Market Leaders dari <b>{len(config.KOMPAS100)} saham</b> Kompas100..."
+        f"\n<i>Proses sekitar 5-10 detik...</i>",
+        parse_mode=ParseMode.HTML)
+
+    try:
+        data = await asyncio.get_event_loop().run_in_executor(
+            None, get_market_leaders, config.KOMPAS100)
+
+        if not data:
+            await msg.edit_text(f"{EMOJI['cross']} Gagal mengambil data market.", parse_mode=ParseMode.HTML)
+            return
+
+        waktu = datetime.now(WIB).strftime("%d %b %Y, %H:%M WIB")
+        
+        # Helper format
+        def format_currency(val):
+            if val >= 1e12:
+                return f"Rp {val/1e12:.1f}T"
+            elif val >= 1e9:
+                return f"Rp {val/1e9:.1f}M"
+            else:
+                return f"Rp {val:,.0f}"
+
+        def format_vol(val):
+            if val >= 1e6:
+                return f"{val/1e6:.1f}Jt"
+            elif val >= 1e3:
+                return f"{val/1e3:.0f}Rb"
+            return f"{val:,.0f}"
+
+        txt = f"🌐 <b>MARKET LEADERS KOMPAS100</b>\n"
+        txt += f"<i>Update: {waktu}</i>\n"
+        txt += f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+
+        # 1. Top Gainers
+        txt += f"🚀 <b>TOP GAINERS (Hari Ini)</b>\n"
+        if data.get("top_gainer"):
+            for i, x in enumerate(data["top_gainer"], 1):
+                txt += f"{i}. <b>{x['kode']}</b> :  Rp {x['harga']:,.0f} (<b>+{x['change_pct']:.1f}%</b>)\n"
+        else:
+            txt += "<i>Belum ada data...</i>\n"
+        txt += "\n"
+
+        # 2. Live Rebound
+        txt += f"🟢 <b>LIVE REBOUND (Sentuh Support & Naik)</b>\n"
+        if data.get("live_rebound"):
+            for i, x in enumerate(data["live_rebound"], 1):
+                txt += f"{i}. <b>{x['kode']}</b> :  Rp {x['harga']:,.0f} (<b>+{x['change_pct']:.1f}%</b>)\n"
+        else:
+            txt += "<i>Tidak ada saham yang rebound hari ini...</i>\n"
+        txt += "\n"
+
+        # 3. Top Value
+        txt += f"💸 <b>TOP TRANSAKSI (Rp Value)</b>\n"
+        if data.get("top_value"):
+            for i, x in enumerate(data["top_value"], 1):
+                txt += f"{i}. <b>{x['kode']}</b> :  {format_currency(x['value'])}\n"
+        else:
+            txt += "<i>Belum ada data...</i>\n"
+        txt += "\n"
+
+        # 4. Top Volume
+        txt += f"📊 <b>TOP VOLUME TRANSAKSI</b>\n"
+        if data.get("top_volume"):
+            for i, x in enumerate(data["top_volume"], 1):
+                txt += f"{i}. <b>{x['kode']}</b> :  {format_vol(x['volume'])} lbr\n"
+        else:
+            txt += "<i>Belum ada data...</i>\n"
+
+        txt += f"\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        txt += f"💡 <i>Gunakan /screening [KODE] untuk cek teknikal.</i>"
+
+        await msg.edit_text(txt, parse_mode=ParseMode.HTML)
+
+    except Exception as e:
+        logger.error(f"[BOT] Error /market: {e}")
+        await msg.edit_text(f"{EMOJI['cross']} Error saat mengambil data market.", parse_mode=ParseMode.HTML)
+
+
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
@@ -840,6 +933,7 @@ async def post_init(application: Application) -> None:
     commands = [
         BotCommand("start", "Menu utama"),
         BotCommand("screening", "Analisa + Chart saham (contoh: /screening INET)"),
+        BotCommand("market", "Data Top Gainer, Vol, Value & Rebound"),
         BotCommand("rekomendasi", "Top saham kandidat BUY hari ini dari Kompas100"),
         BotCommand("danger", "Radar saham berbahaya/merah hari ini"),
         BotCommand("watchlist", "Daftar saham radar"),
@@ -866,6 +960,7 @@ def main() -> None:
     application.add_handler(CommandHandler("help", cmd_help))
     application.add_handler(CommandHandler("watchlist", cmd_watchlist))
     application.add_handler(CommandHandler("screening", cmd_screening))
+    application.add_handler(CommandHandler("market", cmd_market))
     application.add_handler(CommandHandler("rekomendasi", cmd_rekomendasi))
     application.add_handler(CommandHandler("danger", cmd_danger))
     application.add_handler(CallbackQueryHandler(handle_callback))

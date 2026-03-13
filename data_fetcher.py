@@ -583,6 +583,77 @@ def scan_kompas100_danger(kode_list: list[str]) -> list[dict]:
             dangerous.append(result)
 
     dangerous.sort(key=lambda x: x["danger_score"], reverse=True)
-    logger.info(f"[DANGER] ⚠️ {len(dangerous)} saham berbahaya terdeteksi")
-    return dangerous[:10]  # Top 10 paling berbahaya
+    logger.info(f"[DANGER] ✅ {len(dangerous)} bahaya terdeteksi")
+    return dangerous[:10]  # Top 10
+
+
+def get_market_leaders(kode_list: list[str]) -> dict:
+    """
+    (v4.0) Ambil data market leaders: Top Gainer, Top Volume, Top Value, dan Live Rebound.
+    Hanya butuh data OHLCV dasar, sangat cepat menggunakan bulk_fetch_ohlcv.
+    """
+    logger.info(f"[MARKET] Mengambil market data dari {len(kode_list)} saham...")
+    data_map = bulk_fetch_ohlcv(kode_list, interval="1d", period="2d") # Pakai daily untuk gain hari ini
+    
+    all_data = []
+    
+    for kode, df in data_map.items():
+        try:
+            if len(df) < 2:
+                continue
+            
+            # Hari ini
+            current = df.iloc[-1]
+            close = float(current["close"])
+            open_price = float(current["open"])
+            low = float(current["low"])
+            high = float(current["high"])
+            vol = float(current["volume"])
+            
+            # Kemarin
+            prev = df.iloc[-2]
+            prev_close = float(prev["close"])
+            prev_high = float(prev["high"])
+            prev_low = float(prev["low"])
+            
+            # Kalkulasi Pivot Point standar klasik
+            pp = (prev_high + prev_low + prev_close) / 3
+            s1 = (2 * pp) - prev_high
+            
+            # Metric
+            change_pct = ((close - prev_close) / prev_close) * 100
+            value = close * vol
+            
+            # Rebound logic: sempat turun kena Support 1 tapi ditutup (current) hijau di atas open
+            is_rebound = low <= s1 and close > open_price and change_pct > 0
+            
+            all_data.append({
+                "kode": kode,
+                "harga": close,
+                "change_pct": change_pct,
+                "volume": vol,
+                "value": value,
+                "is_rebound": is_rebound
+            })
+        except Exception:
+            pass
+            
+    if not all_data:
+        return {}
+
+    # Sort data
+    top_gainers = sorted(all_data, key=lambda x: x["change_pct"], reverse=True)[:5]
+    top_volume = sorted(all_data, key=lambda x: x["volume"], reverse=True)[:5]
+    top_value = sorted(all_data, key=lambda x: x["value"], reverse=True)[:5]
+    live_rebound = [d for d in all_data if d["is_rebound"]]
+    # Sort rebound berdasarkan change terkuat
+    live_rebound = sorted(live_rebound, key=lambda x: x["change_pct"], reverse=True)[:5]
+    
+    logger.info("[MARKET] ✅ Berhasil mendapatkan data market leaders")
+    return {
+        "top_gainer": top_gainers,
+        "top_volume": top_volume,
+        "top_value": top_value,
+        "live_rebound": live_rebound
+    }
 
