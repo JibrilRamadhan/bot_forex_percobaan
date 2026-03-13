@@ -44,6 +44,7 @@ from ai_analyzer import (
     analyze_sentiment, is_signal_approved, get_final_recommendation,
     analyze_autoscalping
 )
+from db_manager import init_db, log_signal
 
 # ----------------------------------------------------------------
 # LOGGING
@@ -310,7 +311,7 @@ def build_screening_message(screening_data: dict, sentiment_data: dict, headline
 ━━━━━━━━━━━━━━━━━━━━━━━━
 
 {EMOJI['clock']} {waktu_wib}
-{EMOJI['info']} <i>⚠️ Bukan rekomendasi resmi. Selalu DYOR!</i>
+{EMOJI['info']} <i>⚠️ Bukan rekomendasi resmi. Selalu DYOR! by JR</i>
 """.strip()
     return msg
 
@@ -383,7 +384,7 @@ def build_signal_alert_message(screening_data: dict, sentiment_data: dict) -> st
 
 🏁 <b>REKOMENDASI: {reko_label}</b>
 
-{EMOJI['clock']} {waktu_wib} | {EMOJI['info']} <i>DYOR!</i>
+{EMOJI['clock']} {waktu_wib} | {EMOJI['info']} <i>DYOR! by JR</i>
 """.strip()
     return msg
 
@@ -463,7 +464,7 @@ Sinyal 15m valid HANYA jika trend harian juga naik
 (harga > EMA20 Daily). Filter sinyal palsu!
 
 ━━━━━━━━━━━━━━━━━━━━━━━━
-{EMOJI['warning']} <i>Bot ini adalah alat bantu. BUKAN rekomendasi resmi. DYOR! by J</i>
+{EMOJI['warning']} <i>Bot ini adalah alat bantu. BUKAN rekomendasi resmi. DYOR! by JR</i>
 """.strip()
     await update.message.reply_text(pesan, parse_mode=ParseMode.HTML)
 
@@ -535,11 +536,10 @@ async def cmd_screening(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
             # Step 2: News
             await loading_msg.edit_text(
-                f"{EMOJI['news']} <b>[2/4]</b> Mengumpulkan berita dari 4+ sumber...\n"
-                f"<i>(30-90 detik untuk akurasi tinggi)</i>",
+                f"{EMOJI['news']} <b>[2/4]</b> Mengumpulkan berita dari 4+ sumber (Async)...\n"
+                f"<i>(Hanya butuh 1-3 detik)</i>",
                 parse_mode=ParseMode.HTML)
-            headlines = await asyncio.get_event_loop().run_in_executor(
-                None, get_news_for_stock, kode_input)
+            headlines = await get_news_for_stock(kode_input)
 
             # Step 3: AI Analysis with technical context
             await loading_msg.edit_text(
@@ -552,8 +552,7 @@ async def cmd_screening(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 "bb_squeeze": screening_data["kondisi"]["bollinger"]["squeeze"],
                 "bb_breakout": screening_data["kondisi"]["bollinger"]["breakout"],
             }
-            sentiment_data = await asyncio.get_event_loop().run_in_executor(
-                None, analyze_sentiment, kode_input, headlines, tech_ctx)
+            sentiment_data = await analyze_sentiment(kode_input, headlines, tech_ctx)
 
             # Step 4: Generate chart
             await loading_msg.edit_text(
@@ -656,7 +655,7 @@ async def cmd_rekomendasi(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             + "\n\n".join(baris)
             + f"\n\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"{EMOJI['clock']} {waktu}\n"
-            f"{EMOJI['info']} <i>Gunakan /screening [KODE] untuk analisa chart lengkap</i>"
+            f"{EMOJI['info']} <i>Gunakan /screening [KODE] untuk analisa chart lengkap. by JR</i>"
         )
         await msg.edit_text(teks, parse_mode=ParseMode.HTML)
 
@@ -712,7 +711,7 @@ async def cmd_danger(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             + "\n\n".join(baris)
             + f"\n\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"{EMOJI['clock']} {waktu}\n"
-            f"{EMOJI['info']} <i>Hindari masuk posisi pada saham di atas! {EMOJI['shield']}</i>"
+            f"{EMOJI['info']} <i>Hindari masuk posisi pada saham di atas! by JR {EMOJI['shield']}</i>"
         )
         await msg.edit_text(teks, parse_mode=ParseMode.HTML)
 
@@ -798,7 +797,7 @@ async def cmd_market(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             txt += "<i>Belum ada data...</i>\n"
 
         txt += f"\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        txt += f"💡 <i>Gunakan /screening [KODE] untuk cek teknikal.</i>"
+        txt += f"💡 <i>Gunakan /screening [KODE] untuk cek teknikal. by JR</i>"
 
         await msg.edit_text(txt, parse_mode=ParseMode.HTML)
 
@@ -837,8 +836,7 @@ async def cmd_autoscalping(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             parse_mode=ParseMode.HTML)
 
         # FASE 2: Macro News
-        macro_news = await asyncio.get_event_loop().run_in_executor(
-            None, get_macro_news, 3)
+        macro_news = await get_macro_news(3)
 
         await msg.edit_text(
             f"🧠 <b>Fase 3/3:</b> Llama-3 70B sedang meramu Trading Plan...", 
@@ -887,13 +885,24 @@ async def cmd_autoscalping(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             f"🛑 <b>CUT LOSS:</b> <code>{sl}</code>\n\n"
             
             f"⚠️ <b>Pesan AI:</b> <i>{psikologi}</i>\n"
+            f"💡 <i>DYOR! by JR</i>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
         )
         await msg.edit_text(teks, parse_mode=ParseMode.HTML)
         
-        # Opsi: Kirim chart sekalian agar user bisa lihat visual
-        from bot import generate_chart
+        # Log to Database
         cand_dict = {c["kode"]: c for c in candidates}
+        try:
+            if kode in cand_dict:
+                harga_skrg = cand_dict[kode].get("harga_terakhir", 0.0)
+                rr = cand_dict[kode].get("kondisi", {}).get("risk_reward", {})
+                target_q = rr.get("target_price_1", 0.0)
+                sl_q = rr.get("stop_loss_price", 0.0)
+                await log_signal("AUTOSCALPING", kode, harga_skrg, target_q, sl_q)
+        except Exception as db_err:
+            logger.error(f"[DB] Error logging autoscalp signal: {db_err}")
+        
+        # Opsi: Kirim chart sekalian agar user bisa lihat visual
         if kode in cand_dict:
             df = cand_dict[kode]["df"]
             score = cand_dict[kode]["technical_score"]
@@ -976,8 +985,7 @@ async def radar_scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                 logger.info(f"[RADAR] {kode}: daily downtrend → skip")
                 continue
 
-            headlines = await asyncio.get_event_loop().run_in_executor(
-                None, get_news_for_stock, kode)
+            headlines = await get_news_for_stock(kode)
             tech_ctx = {
                 "technical_score": data.get("technical_score", 0),
                 "rsi": data["kondisi"]["rsi"]["nilai"],
@@ -985,8 +993,7 @@ async def radar_scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                 "bb_squeeze": data["kondisi"]["bollinger"]["squeeze"],
                 "bb_breakout": data["kondisi"]["bollinger"]["breakout"],
             }
-            sentiment = await asyncio.get_event_loop().run_in_executor(
-                None, analyze_sentiment, kode, headlines, tech_ctx)
+            sentiment = await analyze_sentiment(kode, headlines, tech_ctx)
 
             if not is_signal_approved(sentiment):
                 logger.info(f"[RADAR] ⛔ {kode} difilter sentimen Bearish")
@@ -1004,6 +1011,16 @@ async def radar_scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                 await context.bot.send_message(
                     chat_id=config.TELEGRAM_CHAT_ID, text=pesan,
                     parse_mode=ParseMode.HTML)
+
+            # Log to Database
+            try:
+                harga = data.get("harga_terakhir", 0.0)
+                rr = data.get("kondisi", {}).get("risk_reward", {})
+                target = rr.get("target_price_1", 0.0)
+                sl = rr.get("stop_loss_price", 0.0)
+                await log_signal("RADAR_SCAN", kode, harga, target, sl)
+            except Exception as db_err:
+                logger.error(f"[DB] Error logging radar signal: {db_err}")
 
             sinyal += 1
             await asyncio.sleep(2)
@@ -1038,6 +1055,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 # SETUP
 # ----------------------------------------------------------------
 async def post_init(application: Application) -> None:
+    await init_db()
     logger.info("[BOT] ✅ Terhubung ke Telegram.")
     commands = [
         BotCommand("start", "Menu utama"),

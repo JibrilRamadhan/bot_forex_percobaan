@@ -660,14 +660,33 @@ def get_market_leaders(kode_list: list[str]) -> dict:
 
 def get_autoscalping_candidates(kode_list: list[str]) -> list[dict]:
     """
-    (v5.0) Cari 1-3 kandidat TERBAIK secara kuantitatif untuk Auto Scalping.
+    (v5.0 & v6.0) Cari 1-3 kandidat TERBAIK secara kuantitatif untuk Auto Scalping.
     Kriteria ekstrim:
     - Volume Surge sangat tinggi (>2.5x rata-rata)
     - Harga dalam tren naik (Uptrend Daily)
     - RSI tidak boleh Extreme Overbought (RSI < 75) agar masih ada upside.
     - Squeeze Breakout mendapat bobot ekstra.
+    - (v6.0) IHSG Trend Penality: Jika market sedang crash, nyali bot dikurangi.
     """
     logger.info(f"[AUTOSCALP] Memulai filter kuantitatif scalping dari {len(kode_list)} saham...")
+    
+    # -- V6.0 IHSG MACRO WEATHER CHECK --
+    is_ihsg_dumping = False
+    try:
+        ihsg_df = yf.Ticker("^JKSE").history(period="2d", interval="1d")
+        if len(ihsg_df) >= 2:
+            prev_close = ihsg_df['Close'].iloc[-2]
+            curr_close = ihsg_df['Close'].iloc[-1]
+            ihsg_pct = ((curr_close - prev_close) / prev_close) * 100
+            
+            if ihsg_pct <= -0.6:  # IHSG turun tajam > 0.6% sehari
+                is_ihsg_dumping = True
+                logger.warning(f"[AUTOSCALP] ⚠️ CUACA BURUK: IHSG Drop {ihsg_pct:.2f}%. Bot akan sangat defensif.")
+            else:
+                logger.info(f"[AUTOSCALP] 🌤 Cuaca IHSG Aman ({ihsg_pct:.2f}%).")
+    except Exception as e:
+        logger.error(f"[AUTOSCALP] Gagal cek IHSG: {e}")
+
     data_map = bulk_fetch_ohlcv(kode_list)
     candidates = []
 
@@ -695,18 +714,23 @@ def get_autoscalping_candidates(kode_list: list[str]) -> list[dict]:
         if not daily_trend_ok:
             continue
             
-        # Hitung Scalp Power (metric gabungan Volume + Momentum Squeeze)
+        # Hitung Scalp Power (metric gabungan Volume + Momentum Squeeze + IHSG Context)
         is_squeeze_break = full_data["kondisi"]["bollinger"]["breakout"]
         scalp_power = score + (vol_surge * 10) + (20 if is_squeeze_break else 0)
+        
+        # Penalti Cuaca IHSG Jeles (v6.0)
+        if is_ihsg_dumping:
+            scalp_power -= 25  # Kurangi nyali secara drastis
         
         full_data["scalp_power"] = scalp_power
         candidates.append(full_data)
 
-    # Sort dari scalp power tertinngi
+    # Sort dari scalp power tertinggi
     candidates.sort(key=lambda x: x.get("scalp_power", 0), reverse=True)
     
-    # Ambil maksimal 3
-    final_candidates = candidates[:3]
+    # Ambil maksimal 3 yang powernya masih kuat biarpun dipenalti
+    final_candidates = [c for c in candidates if c["scalp_power"] > 70][:3]
+    
     logger.info(f"[AUTOSCALP] ✅ Filter matematis selesai. Ditemukan {len(final_candidates)} top class scalping.")
     return final_candidates
 

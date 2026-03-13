@@ -12,6 +12,7 @@ import json
 import logging
 import time
 import re
+import asyncio
 from datetime import datetime, timedelta
 
 from groq import Groq
@@ -48,28 +49,9 @@ def get_gemini_client() -> genai.Client:
 
 
 # ----------------------------------------------------------------
-# SENTIMENT + RECOMMENDATION CACHE
+# SENTIMENT + RECOMMENDATION CACHE (Database Migration v6.0)
 # ----------------------------------------------------------------
-_sentiment_cache: dict = {}
-
-
-def _get_cached(kode: str) -> dict | None:
-    if kode not in _sentiment_cache:
-        return None
-    cached = _sentiment_cache[kode]
-    age = datetime.now() - cached["timestamp"]
-    ttl = timedelta(minutes=config.SENTIMENT_CACHE_TTL_MINUTES)
-    if age < ttl:
-        sisa = int((ttl - age).total_seconds() / 60)
-        logger.info(f"[AI] 💾 Cache hit {kode} (sisa {sisa} mnt)")
-        return cached["result"]
-    del _sentiment_cache[kode]
-    return None
-
-
-def _save_cache(kode: str, result: dict) -> None:
-    _sentiment_cache[kode] = {"result": result, "timestamp": datetime.now()}
-    logger.info(f"[AI] 💾 Cache disimpan untuk {kode}")
+from db_manager import get_cached_sentiment, save_cached_sentiment
 
 
 # ----------------------------------------------------------------
@@ -237,24 +219,19 @@ def _analyze_gemini(kode: str, headlines: list[str], tech_ctx: dict | None) -> d
 # ----------------------------------------------------------------
 # FUNGSI UTAMA
 # ----------------------------------------------------------------
-def analyze_sentiment(
+async def analyze_sentiment(
     kode_saham: str,
     headlines: list[str],
     tech_context: dict | None = None,
     max_retry: int = 3,
 ) -> dict:
     """
-    Analisa sentimen + rekomendasi trading dengan double-layer AI + cache.
-    
-    Args:
-        kode_saham: Kode saham (misal 'INET' atau 'INET.JK')
-        headlines: List judul berita terbaru
-        tech_context: Dict data teknikal untuk konteks AI (opsional)
+    Analisa sentimen + rekomendasi trading dengan double-layer AI + SQLite cache (v6.0).
     """
     kode = kode_saham.upper().replace(".JK", "")
 
-    # 1. Cek cache
-    cached = _get_cached(kode)
+    # 1. Cek cache DB (async)
+    cached = await get_cached_sentiment(kode, config.SENTIMENT_CACHE_TTL_MINUTES)
     if cached is not None:
         return {**cached, "dari_cache": True}
 
@@ -263,12 +240,14 @@ def analyze_sentiment(
         logger.warning(f"[AI] Tidak ada berita untuk {kode}")
         return _neutral_result(kode, len(headlines), reason="no_news")
 
-    # 3. Groq (primary)
-    result = _analyze_groq(kode, headlines, tech_context)
+    loop = asyncio.get_event_loop()
 
-    # 4. Gemini (fallback)
+    # 3. Groq (primary) - Jalan di Executor
+    result = await loop.run_in_executor(None, _analyze_groq, kode, headlines, tech_context)
+
+    # 4. Gemini (fallback) - Jalan di Executor
     if result is None:
-        result = _analyze_gemini(kode, headlines, tech_context)
+        result = await loop.run_in_executor(None, _analyze_gemini, kode, headlines, tech_context)
 
     # 5. Semua gagal
     if result is None:
@@ -276,7 +255,9 @@ def analyze_sentiment(
         return _neutral_result(kode, len(headlines), reason="api_error")
 
     result["headlines_dianalisa"] = len(headlines)
-    _save_cache(kode, result)
+    
+    # 6. Simpan ke Cache DB (async)
+    await save_cached_sentiment(kode, result)
     return result
 
 
@@ -303,14 +284,14 @@ def is_signal_approved(sentiment_result: dict) -> bool:
 
 
 # ----------------------------------------------------------------
-# AUTOSCALPING INFERENCE (v5.0)
+# AUTOSCALPING INFERENCE (v5.0 & v6.0)
 # ----------------------------------------------------------------
-def analyze_autoscalping(candidates: list[dict], macro_news: list[str]) -> dict | None:
+async def analyze_autoscalping(candidates: list[dict], macro_news: list[str]) -> dict | None:
     """
     Kirim semua kandidat dan berita makro sekaligus ke Llama-3 (Groq) untuk dipilih pemenangnya.
     Fallbak ke Gemini jika Groq limit.
     """
-    logger.info("[AI_SCALP] Memulai perumusan Trading Plan AutoScalping...")
+    logger.info("[AI_SCALP] Memulai perumusan Trading Plan AutoScalping (Async)...")
     
     macro_text = "\n".join(f"- {n}" for n in macro_news) if macro_news else "Tidak ada berita makro terbaru."
     
@@ -326,7 +307,7 @@ def analyze_autoscalping(candidates: list[dict], macro_news: list[str]) -> dict 
         
         # Ambil 3 headline berita khusus perusahaan ini
         from news_scraper import get_news_for_stock
-        stock_news = get_news_for_stock(kode, max_articles=3)
+        stock_news = await get_news_for_stock(kode, max_articles=3)
         news_str = "\n  - ".join(stock_news) if stock_news else "Tidak ada berita korporasi spesifik terbaru."
         
         cand_text += f"\nKANDIDAT: {kode} (Rp {harga:,.0f} | Naik: {pct:.1f}%)\n"
@@ -343,7 +324,8 @@ def analyze_autoscalping(candidates: list[dict], macro_news: list[str]) -> dict 
     if config.GROQ_API_KEY:
         try:
             client = get_groq_client()
-            chat = client.chat.completions.create(
+            loop = asyncio.get_event_loop()
+            chat = await loop.run_in_executor(None, lambda: client.chat.completions.create(
                 model=config.GROQ_MODEL,
                 messages=[
                     {"role": "system", "content": AUTOSCALP_SYSTEM_PROMPT},
@@ -352,7 +334,7 @@ def analyze_autoscalping(candidates: list[dict], macro_news: list[str]) -> dict 
                 temperature=0.2, # Sedikit dinaikkan agar analitis
                 max_tokens=800,
                 response_format={"type": "json_object"},
-            )
+            ))
             text = chat.choices[0].message.content.strip()
             return json.loads(text)
         except Exception as e:
@@ -363,7 +345,8 @@ def analyze_autoscalping(candidates: list[dict], macro_news: list[str]) -> dict 
         try:
             client = get_gemini_client()
             full_prompt = f"{AUTOSCALP_SYSTEM_PROMPT}\n\n{user_prompt}"
-            response = client.models.generate_content(
+            loop = asyncio.get_event_loop()
+            response = await loop.run_in_executor(None, lambda: client.models.generate_content(
                 model=config.GEMINI_MODEL,
                 contents=full_prompt,
                 config=types.GenerateContentConfig(
@@ -372,7 +355,7 @@ def analyze_autoscalping(candidates: list[dict], macro_news: list[str]) -> dict 
                     max_output_tokens=800,
                     response_mime_type="application/json"
                 ),
-            )
+            ))
             return json.loads(response.text.strip())
         except Exception as e:
             logger.error(f"[AI_SCALP] Gemini error: {e}")

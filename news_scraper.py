@@ -15,8 +15,8 @@ Sumber berita:
 
 import logging
 import re
-import time
-import requests
+import asyncio
+import aiohttp
 import feedparser
 from typing import Optional
 from bs4 import BeautifulSoup
@@ -37,27 +37,20 @@ HEADERS = {
 
 
 # ----------------------------------------------------------------
-# FUNGSI UTAMA: AMBIL BERITA DARI RSS FEED
+# FUNGSI UTAMA: AMBIL BERITA DARI RSS FEED (ASYNC)
 # ----------------------------------------------------------------
-def fetch_from_rss(feed_url: str, timeout: int = 10) -> list[dict]:
+async def fetch_from_rss(session: aiohttp.ClientSession, feed_url: str, timeout: int = 10) -> list[dict]:
     """
-    Mengambil entri berita dari satu URL RSS feed.
-    
-    Args:
-        feed_url: URL dari RSS feed.
-        timeout: Batas waktu request dalam detik.
-        
-    Returns:
-        List berisi dictionary dengan 'judul' dan 'link' setiap berita.
+    Mengambil entri berita dari satu URL RSS feed secara asynchronous.
     """
     articles = []
     try:
-        # Gunakan requests terlebih dahulu untuk handle redirect/header kustom
-        response = requests.get(feed_url, headers=HEADERS, timeout=timeout)
-        response.raise_for_status()
+        async with session.get(feed_url, headers=HEADERS, timeout=timeout) as response:
+            response.raise_for_status()
+            content = await response.text()
 
         # Parse RSS feed menggunakan feedparser
-        feed = feedparser.parse(response.content)
+        feed = feedparser.parse(content)
 
         for entry in feed.entries:
             judul = entry.get("title", "").strip()
@@ -65,42 +58,32 @@ def fetch_from_rss(feed_url: str, timeout: int = 10) -> list[dict]:
             if judul:
                 articles.append({"judul": judul, "link": link})
 
-    except requests.exceptions.Timeout:
+    except asyncio.TimeoutError:
         logger.warning(f"[SCRAPER] Timeout saat mengakses: {feed_url}")
-    except requests.exceptions.RequestException as e:
-        logger.warning(f"[SCRAPER] Request error untuk {feed_url}: {e}")
     except Exception as e:
-        logger.warning(f"[SCRAPER] Error parse RSS dari {feed_url}: {e}")
+        logger.warning(f"[SCRAPER] Error fetch RSS {feed_url}: {e}")
 
     return articles
 
 
-def fetch_yahoo_finance_news(ticker_jk: str, timeout: int = 10) -> list[dict]:
+async def fetch_yahoo_finance_news(session: aiohttp.ClientSession, ticker_jk: str, timeout: int = 10) -> list[dict]:
     """
-    Mengambil berita dari Yahoo Finance untuk ticker saham tertentu.
-    Menggunakan scraping halaman karena RSS Yahoo Finance terbatas.
-    
-    Args:
-        ticker_jk: Ticker dengan suffix .JK (contoh: 'INET.JK').
-        timeout: Batas waktu request dalam detik.
-        
-    Returns:
-        List berisi dictionary dengan 'judul' dan 'link' berita.
+    Mengambil berita dari Yahoo Finance untuk ticker saham tertentu secara asynchronous.
     """
     articles = []
     url = f"https://finance.yahoo.com/quote/{ticker_jk}/news/"
     
     try:
-        response = requests.get(url, headers=HEADERS, timeout=timeout)
-        response.raise_for_status()
-        soup = BeautifulSoup(response.text, "lxml")
+        async with session.get(url, headers=HEADERS, timeout=timeout) as response:
+            response.raise_for_status()
+            html = await response.text()
+            
+        soup = BeautifulSoup(html, "lxml")
 
-        # Cari elemen berita di halaman Yahoo Finance
-        # Selector ini mungkin perlu diupdate jika Yahoo mengubah struktur DOM
+        # Cari elemen berita
         news_items = soup.find_all("h3", class_=re.compile(r".*Mb.*|.*title.*", re.I))
 
         if not news_items:
-            # Fallback: cari semua anchor tag di dalam artikel
             news_items = soup.select("li.js-stream-content h3")
 
         for item in news_items[:config.MAX_NEWS_ARTICLES]:
@@ -112,7 +95,7 @@ def fetch_yahoo_finance_news(ticker_jk: str, timeout: int = 10) -> list[dict]:
             if teks:
                 articles.append({"judul": teks, "link": link})
 
-    except requests.exceptions.Timeout:
+    except asyncio.TimeoutError:
         logger.warning(f"[SCRAPER] Yahoo Finance timeout untuk {ticker_jk}")
     except Exception as e:
         logger.warning(f"[SCRAPER] Error scrape Yahoo Finance untuk {ticker_jk}: {e}")
@@ -164,64 +147,63 @@ def filter_relevant_news(articles: list[dict], kode_saham: str) -> list[dict]:
 
 
 # ----------------------------------------------------------------
-# FUNGSI UTAMA: CARI BERITA UNTUK SATU SAHAM
+# FUNGSI UTAMA: CARI BERITA UNTUK SATU SAHAM (ASYNC)
 # ----------------------------------------------------------------
-def get_news_for_stock(kode_saham: str, max_articles: int = config.MAX_NEWS_ARTICLES) -> list[str]:
+async def get_news_for_stock(kode_saham: str, max_articles: int = config.MAX_NEWS_ARTICLES) -> list[str]:
     """
-    Fungsi utama untuk mencari berita terbaru tentang sebuah saham.
-    Menggabungkan hasil dari semua sumber RSS dan Yahoo Finance untuk akurasi tinggi.
-    Waktu eksekusi normal: 30-90 detik.
+    Fungsi utama untuk mencari berita terbaru tentang sebuah saham secara konruen (async).
+    Waktu eksekusi normal memendek menjadi <3 detik.
     """
     kode_bersih = kode_saham.upper().replace(".JK", "")
     ticker_jk = f"{kode_bersih}.JK"
     all_articles = []
 
-    logger.info(f"[SCRAPER] Mencari berita untuk: {kode_bersih} (semua sumber)")
+    logger.info(f"[SCRAPER] ⚡ Async search untuk: {kode_bersih}")
 
-    # 4 sumber RSS utama — setiap sumber diberi timeout 8 detik
     rss_sources = [
-        ("CNBC Indonesia", "https://www.cnbcindonesia.com/rss"),
+        ("CNBC", "https://www.cnbcindonesia.com/rss"),
         ("Kontan Investasi", "https://www.kontan.co.id/rss/investasi.rss"),
         ("Kontan Saham", "https://www.kontan.co.id/rss/saham.rss"),
-        ("Bisnis.com", "https://ekonomi.bisnis.com/feed"),
+        ("Bisnis", "https://ekonomi.bisnis.com/feed"),
     ]
 
-    for nama_sumber, url in rss_sources:
-        try:
-            articles = fetch_from_rss(url, timeout=8)
-            filtered = filter_relevant_news(articles, kode_bersih)
-            if filtered:
-                logger.info(f"[SCRAPER] {nama_sumber}: {len(filtered)} berita relevan ditemukan")
-            all_articles.extend(filtered)
-            time.sleep(0.3)  # Jeda pendek antar request
-        except Exception as e:
-            logger.warning(f"[SCRAPER] Error sumber {nama_sumber}: {e}")
+    async with aiohttp.ClientSession() as session:
+        # Siapkan task RSS
+        tasks = [fetch_from_rss(session, url, timeout=8) for name, url in rss_sources]
+        # Siapkan task Yahoo
+        yahoo_task = fetch_yahoo_finance_news(session, ticker_jk, timeout=10)
+        
+        # Eksekusi PARALEL bersamaan
+        results = await asyncio.gather(*tasks, yahoo_task, return_exceptions=True)
+        
+        # Proses RSS results
+        for i, res in enumerate(results[:-1]):
+            src_name = rss_sources[i][0]
+            if isinstance(res, Exception):
+                logger.warning(f"[SCRAPER] Error {src_name}: {res}")
+            elif res:
+                filtered = filter_relevant_news(res, kode_bersih)
+                if filtered:
+                    all_articles.extend(filtered)
+        
+        # Proses Yahoo result
+        yres = results[-1]
+        if isinstance(yres, Exception):
+            logger.warning(f"[SCRAPER] Error Yahoo Finance: {yres}")
+        elif yres:
+            all_articles.extend(yres)
 
-    # Yahoo Finance — scraping langsung per ticker (lebih spesifik)
-    try:
-        yahoo_articles = fetch_yahoo_finance_news(ticker_jk, timeout=10)
-        if yahoo_articles:
-            logger.info(f"[SCRAPER] Yahoo Finance: {len(yahoo_articles)} berita ditemukan")
-        all_articles.extend(yahoo_articles)
-    except Exception as e:
-        logger.warning(f"[SCRAPER] Yahoo Finance error: {e}")
+        # Jika masih kosong, tembak Google News (tunggu ini selesai)
+        if not all_articles:
+            logger.info(f"[SCRAPER] Fallback Google News untuk {kode_bersih}...")
+            gnews_url = f"https://news.google.com/rss/search?q=saham+{kode_bersih}+IHSG&hl=id&gl=ID&ceid=ID:id"
+            try:
+                g_art = await fetch_from_rss(session, gnews_url, timeout=10)
+                all_articles.extend(g_art[:max_articles])
+            except Exception as e:
+                logger.warning(f"[SCRAPER] Google fallback error: {e}")
 
-    # Fallback: Google News RSS jika semua sumber kosong
-    if not all_articles:
-        logger.info(f"[SCRAPER] Fallback ke Google News RSS untuk {kode_bersih}...")
-        google_news_url = (
-            f"https://news.google.com/rss/search"
-            f"?q=saham+{kode_bersih}+IHSG&hl=id&gl=ID&ceid=ID:id"
-        )
-        try:
-            google_articles = fetch_from_rss(google_news_url, timeout=10)
-            all_articles.extend(google_articles[:max_articles])
-            if all_articles:
-                logger.info(f"[SCRAPER] Google News: {len(all_articles)} berita ditemukan")
-        except Exception as e:
-            logger.warning(f"[SCRAPER] Google News fallback error: {e}")
-
-    # Hapus duplikat berdasarkan judul
+    # Hapus duplikat
     seen_titles = set()
     unique_articles = []
     for article in all_articles:
@@ -234,36 +216,32 @@ def get_news_for_stock(kode_saham: str, max_articles: int = config.MAX_NEWS_ARTI
     if headlines:
         logger.info(f"[SCRAPER] ✅ Total {len(headlines)} berita unik untuk {kode_bersih}")
     else:
-        logger.warning(f"[SCRAPER] ⚠️ Tidak ada berita untuk {kode_bersih} — sentimen default Neutral")
+        logger.warning(f"[SCRAPER] ⚠️ Tidak ada berita untuk {kode_bersih}")
 
     return headlines
 
 
-def get_macro_news(max_articles: int = 5) -> list[str]:
+async def get_macro_news(max_articles: int = 5) -> list[str]:
     """
-    (v5.0) Ambil berita makro ekonomi terkini untuk konteks IHSG dan Auto Scalping.
-    Sumber: CNBC Market, Bisnis Ekonomi, Kontan Makro.
+    (v5.0/v6.0) Ambil berita makro ekonomi terkini secara konruen (async).
     """
-    logger.info("[SCRAPER] Mengambil berita Makro Ekonomi Global & IHSG...")
+    logger.info("[SCRAPER] ⚡ Mengambil berita Markro secara Async...")
     
     macro_sources = [
-        ("CNBC Market", "https://www.cnbcindonesia.com/market/rss"),
-        ("Bisnis Ekonomi", "https://ekonomi.bisnis.com/feed"),
-        ("Kontan Makro", "https://nasional.kontan.co.id/rss/makro.rss"),
+        "https://www.cnbcindonesia.com/market/rss",
+        "https://ekonomi.bisnis.com/feed",
+        "https://nasional.kontan.co.id/rss/makro.rss",
     ]
     
     all_articles = []
-    for nama_sumber, url in macro_sources:
-        try:
-            articles = fetch_from_rss(url, timeout=8)
-            if articles:
-                logger.info(f"[SCRAPER] {nama_sumber}: {len(articles)} berita makro ditemukan")
-            all_articles.extend(articles)
-            time.sleep(0.3)
-        except Exception as e:
-            logger.warning(f"[SCRAPER] Error macro sumber {nama_sumber}: {e}")
+    async with aiohttp.ClientSession() as session:
+        tasks = [fetch_from_rss(session, url, timeout=8) for url in macro_sources]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        for res in results:
+            if not isinstance(res, Exception) and res:
+                all_articles.extend(res)
             
-    # Hapus duplikat
     seen_titles = set()
     unique_headlines = []
     
@@ -273,17 +251,15 @@ def get_macro_news(max_articles: int = 5) -> list[str]:
             unique_headlines.append(article["judul"])
             
     if unique_headlines:
-        logger.info(f"[SCRAPER] ✅ {len(unique_headlines[:max_articles])} berita makro berhasil diambil")
-    else:
-        logger.warning("[SCRAPER] ⚠️ Gagal mengambil berita makro.")
-        
+        logger.info(f"[SCRAPER] ✅ {len(unique_headlines[:max_articles])} macro news didapat")
+    
     return unique_headlines[:max_articles]
 
 
 if __name__ == "__main__":
     # Test modul secara standalone
     logging.basicConfig(level=logging.INFO)
-    berita = get_news_for_stock("INET")
+    berita = asyncio.run(get_news_for_stock("INET"))
     print(f"\n{'='*50}")
     print(f"Berita untuk INET:")
     for i, b in enumerate(berita, 1):
