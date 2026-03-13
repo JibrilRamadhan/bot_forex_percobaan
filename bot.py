@@ -255,17 +255,17 @@ def build_screening_message(screening_data: dict, sentiment_data: dict, headline
     cache_note = " <i>(cached)</i>" if dari_cache else ""
 
     msg = f"""
-{EMOJI['radar']} <b>SCREENING: {kode}</b> | <i>{nama}</i>
+{EMOJI['radar']} <b>SCREENING: {kode}</b> | <i>{nama}</i> | <i>by Jibril</i>
 ━━━━━━━━━━━━━━━━━━━━━━━━
 
-{EMOJI['money']} Harga: <code>Rp {harga:,.0f}</code> {perubahan_emoji} {perubahan_str}
+{EMOJI['money']} Harga: <code>Rp {harga:,.0f}</code> {perubahan_emoji} {perubahan_str} <i>by Jibril</i>
 
 ━━━━━━━━━━━━━━━━━━━━━━━━
 {score_color} <b>TECHNICAL SCORE: {tech_score}/100</b>
-<code>[{score_bar}]</code>
+<code>[{score_bar}]</code> <i>by Jibril</i>
 
 ━━━━━━━━━━━━━━━━━━━━━━━━
-{EMOJI['chart']} <b>INDIKATOR TEKNIKAL</b>
+{EMOJI['chart']} <b>INDIKATOR TEKNIKAL</b> <i>by Jibril</i>
 ━━━━━━━━━━━━━━━━━━━━━━━━
 📉 {ema_status}
    └ EMA{config.EMA_FAST}: <code>{ema_fast:,.2f}</code> | EMA{config.EMA_SLOW}: <code>{ema_slow:,.2f}</code>
@@ -554,13 +554,24 @@ async def cmd_screening(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             pesan = build_screening_message(screening_data, sentiment_data, headlines)
 
             if chart_buf:
-                # Kirim chart dulu, BARU hapus loading msg jika berhasil
+                # Telegram limit caption foto = 1024 char.
+                # Solusi: kirim chart dengan caption pendek, analisa sebagai pesan teks terpisah.
+                reko_data = get_final_recommendation(
+                    screening_data.get("technical_score", 0), sentiment_data)
+                reko_label = reko_data["label"]
+                caption_pendek = (
+                    f"📊 <b>{kode_input}</b> | Rp {screening_data['harga_terakhir']:,.0f} "
+                    f"| Score: {screening_data.get('technical_score', 0)}/100\n"
+                    f"🏁 <b>{reko_label}</b>"
+                )
                 try:
                     await update.message.reply_photo(
                         photo=chart_buf,
-                        caption=pesan,
+                        caption=caption_pendek,
                         parse_mode=ParseMode.HTML)
                     await loading_msg.delete()
+                    # Kirim analisa lengkap sebagai pesan teks terpisah
+                    await update.message.reply_text(pesan, parse_mode=ParseMode.HTML)
                 except Exception as photo_err:
                     logger.warning(f"[BOT] Gagal kirim chart, fallback ke teks: {photo_err}")
                     await loading_msg.edit_text(pesan, parse_mode=ParseMode.HTML)
