@@ -657,3 +657,57 @@ def get_market_leaders(kode_list: list[str]) -> dict:
         "live_rebound": live_rebound
     }
 
+
+def get_autoscalping_candidates(kode_list: list[str]) -> list[dict]:
+    """
+    (v5.0) Cari 1-3 kandidat TERBAIK secara kuantitatif untuk Auto Scalping.
+    Kriteria ekstrim:
+    - Volume Surge sangat tinggi (>2.5x rata-rata)
+    - Harga dalam tren naik (Uptrend Daily)
+    - RSI tidak boleh Extreme Overbought (RSI < 75) agar masih ada upside.
+    - Squeeze Breakout mendapat bobot ekstra.
+    """
+    logger.info(f"[AUTOSCALP] Memulai filter kuantitatif scalping dari {len(kode_list)} saham...")
+    data_map = bulk_fetch_ohlcv(kode_list)
+    candidates = []
+
+    for kode, df in data_map.items():
+        # Gunakan full_screening untuk ini karena butuh Daily Trend konfirmasi sejati
+        # Untuk optimasi, kita cek quick_scan dulu. Jika jelek, skip full_screening.
+        quick = quick_scan(kode, df)
+        if not quick:
+            continue
+            
+        score = quick["technical_score"]
+        vol_surge = quick["kondisi"]["volume"]["rasio"]
+        rsi = quick["kondisi"]["rsi"]["nilai"]
+        
+        # Filter awal sangat ketat
+        if score < 60 or vol_surge < 2.0 or rsi >= 75:
+            continue
+            
+        # Jika lolos filter dasar, lakukan full_screening untuk cek Daily Trend
+        full_data = full_screening(kode)
+        if not full_data:
+            continue
+            
+        daily_trend_ok = full_data.get("daily_trend", {}).get("uptrend_daily", False)
+        if not daily_trend_ok:
+            continue
+            
+        # Hitung Scalp Power (metric gabungan Volume + Momentum Squeeze)
+        is_squeeze_break = full_data["kondisi"]["bollinger"]["breakout"]
+        scalp_power = score + (vol_surge * 10) + (20 if is_squeeze_break else 0)
+        
+        full_data["scalp_power"] = scalp_power
+        candidates.append(full_data)
+
+    # Sort dari scalp power tertinngi
+    candidates.sort(key=lambda x: x.get("scalp_power", 0), reverse=True)
+    
+    # Ambil maksimal 3
+    final_candidates = candidates[:3]
+    logger.info(f"[AUTOSCALP] ✅ Filter matematis selesai. Ditemukan {len(final_candidates)} top class scalping.")
+    return final_candidates
+
+

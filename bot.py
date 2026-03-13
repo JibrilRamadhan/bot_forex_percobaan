@@ -37,10 +37,13 @@ from config import validate_config, WIB
 from data_fetcher import (
     full_screening, format_ticker, get_clean_code,
     scan_kompas100_buy, scan_kompas100_danger,
-    get_market_leaders
+    get_market_leaders, get_autoscalping_candidates
 )
-from news_scraper import get_news_for_stock
-from ai_analyzer import analyze_sentiment, is_signal_approved, get_final_recommendation
+from news_scraper import get_news_for_stock, get_macro_news
+from ai_analyzer import (
+    analyze_sentiment, is_signal_approved, get_final_recommendation,
+    analyze_autoscalping
+)
 
 # ----------------------------------------------------------------
 # LOGGING
@@ -413,6 +416,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 ━━━━━━━━━━━━━━━━━━━━━━━━
 📋 <b>PERINTAH UTAMA</b>
 ━━━━━━━━━━━━━━━━━━━━━━━━
+/autoscalping — AI Trading Plan (Terbaik)
 /screening [KODE] — Analisa saham + Chart
 /market — Live Gainers, Volume, Value, Rebound
 /rekomendasi — Top BUY dari Kompas100
@@ -430,6 +434,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 ━━━━━━━━━━━━━━━━━━━━━━━━
 
 {EMOJI['chart_up']} <b>Screening & Rekomendasi:</b>
+<code>/autoscalping</code> — AI pilihkan 1 saham scalping terbaik + Trading Plan murni! (v5.0)
 <code>/screening KODE</code> — Analisa AI & Chart
 <code>/market</code> — Top Gainers, Vol, Value & Rebound
 <code>/rekomendasi</code> — Sinyal BUY terbaik hr ini
@@ -458,7 +463,7 @@ Sinyal 15m valid HANYA jika trend harian juga naik
 (harga > EMA20 Daily). Filter sinyal palsu!
 
 ━━━━━━━━━━━━━━━━━━━━━━━━
-{EMOJI['warning']} <i>Bot ini adalah alat bantu. BUKAN rekomendasi resmi. DYOR!</i>
+{EMOJI['warning']} <i>Bot ini adalah alat bantu. BUKAN rekomendasi resmi. DYOR! by J</i>
 """.strip()
     await update.message.reply_text(pesan, parse_mode=ParseMode.HTML)
 
@@ -802,6 +807,110 @@ async def cmd_market(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await msg.edit_text(f"{EMOJI['cross']} Error saat mengambil data market.", parse_mode=ParseMode.HTML)
 
 
+# ----------------------------------------------------------------
+# /AUTOSCALPING (v5.0) - The Ultimate AI Trading Plan
+# ----------------------------------------------------------------
+async def cmd_autoscalping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Scan Kompas100 secara kuantitatif, lalu biarkan AI membuat Trading Plan untuk 1 saham terbaik."""
+    await update.message.reply_chat_action("typing")
+    msg = await update.message.reply_text(
+        f"{EMOJI['radar']} <b>Fase 1/3:</b> Filter Kuantitatif Ketat dari {len(config.KOMPAS100)} saham...",
+        parse_mode=ParseMode.HTML)
+
+    try:
+        # FASE 1: Filter Kuantitatif
+        candidates = await asyncio.get_event_loop().run_in_executor(
+            None, get_autoscalping_candidates, config.KOMPAS100)
+            
+        if not candidates:
+            await msg.edit_text(
+                f"🤷‍♂️ <b>Tidak ada kandidat sempurna saat ini.</b>\n"
+                f"Pasar tidak sedang memberikan setup scalping yang aman (Volume kurang, atau RSI jelek). "
+                f"<i>Cash is King!</i>", 
+                parse_mode=ParseMode.HTML)
+            return
+
+        cand_str = ", ".join([c['kode'] for c in candidates])
+        await msg.edit_text(
+            f"{EMOJI['search']} <b>Fase 2/3:</b> Mengumpulkan sentimen Makro Ekonomi...\n"
+            f"<i>Lolos filter kuantitatif: {cand_str}</i>", 
+            parse_mode=ParseMode.HTML)
+
+        # FASE 2: Macro News
+        macro_news = await asyncio.get_event_loop().run_in_executor(
+            None, get_macro_news, 3)
+
+        await msg.edit_text(
+            f"🧠 <b>Fase 3/3:</b> Llama-3 70B sedang meramu Trading Plan...", 
+            parse_mode=ParseMode.HTML)
+
+        # FASE 3: AI Inference
+        ai_plan = await asyncio.get_event_loop().run_in_executor(
+            None, analyze_autoscalping, candidates, macro_news)
+
+        if not ai_plan or not isinstance(ai_plan, dict):
+            await msg.edit_text(f"{EMOJI['cross']} AI Gagal meramu Trading Plan. Coba lagi.", parse_mode=ParseMode.HTML)
+            return
+            
+        # Parse output JSON dari AI
+        market_view = ai_plan.get("market_view", "Kondisi pasar standar.")
+        kode = ai_plan.get("pemenang_kode", "N/A").upper()
+        nama = ai_plan.get("pemenang_nama", "")
+        alasan = ai_plan.get("alasan_menang", "")
+        plan = ai_plan.get("trading_plan", {})
+        entry = plan.get("entry_area", "")
+        t1 = plan.get("target_1", "")
+        t2 = plan.get("target_2", "")
+        sl = plan.get("stop_loss", "")
+        psikologi = ai_plan.get("pesan_psikologi", "")
+        
+        # Validasi format kode
+        if not kode.endswith(".JK"):
+            kode_jk = f"{kode}.JK"
+        else:
+            kode_jk = kode
+            kode = kode.replace(".JK", "")
+
+        teks = (
+            f"⚡ <b>AUTO SCALPING TRADING PLAN</b> ⚡\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🌐 <b>Market Hari Ini:</b> {market_view}\n\n"
+            
+            f"🎯 <b>SAHAM TERPILIH: {kode}</b>\n"
+            f"<i>{nama}</i>\n"
+            f"💡 <b>Strategi:</b> {alasan}\n\n"
+            
+            f"⚖️ <b>TRADING PLAN KETAT:</b>\n"
+            f"🟩 <b>ENTRY AREA:</b> <code>{entry}</code>\n"
+            f"🚀 <b>TARGET 1:</b> <code>{t1}</code>\n"
+            f"🚀 <b>TARGET 2:</b> <code>{t2}</code>\n"
+            f"🛑 <b>CUT LOSS:</b> <code>{sl}</code>\n\n"
+            
+            f"⚠️ <b>Pesan AI:</b> <i>{psikologi}</i>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        )
+        await msg.edit_text(teks, parse_mode=ParseMode.HTML)
+        
+        # Opsi: Kirim chart sekalian agar user bisa lihat visual
+        from bot import generate_chart
+        cand_dict = {c["kode"]: c for c in candidates}
+        if kode in cand_dict:
+            df = cand_dict[kode]["df"]
+            score = cand_dict[kode]["technical_score"]
+            photo_io = generate_chart(kode_jk, df, score, "SCALPING PLAN")
+            if photo_io:
+                await context.bot.send_photo(
+                    chat_id=update.effective_chat.id,
+                    photo=photo_io,
+                    caption=f"Visual chart untuk {kode} 👆"
+                )
+
+    except Exception as e:
+        logger.error(f"[BOT] Error /autoscalping: {e}")
+        await msg.edit_text(f"{EMOJI['cross']} Terjadi kesalahan internal.", parse_mode=ParseMode.HTML)
+
+
+
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
@@ -932,6 +1041,7 @@ async def post_init(application: Application) -> None:
     logger.info("[BOT] ✅ Terhubung ke Telegram.")
     commands = [
         BotCommand("start", "Menu utama"),
+        BotCommand("autoscalping", "AI Trading Plan Otomatis (v5.0)"),
         BotCommand("screening", "Analisa + Chart saham (contoh: /screening INET)"),
         BotCommand("market", "Data Top Gainer, Vol, Value & Rebound"),
         BotCommand("rekomendasi", "Top saham kandidat BUY hari ini dari Kompas100"),
@@ -959,6 +1069,7 @@ def main() -> None:
     application.add_handler(CommandHandler("start", cmd_start))
     application.add_handler(CommandHandler("help", cmd_help))
     application.add_handler(CommandHandler("watchlist", cmd_watchlist))
+    application.add_handler(CommandHandler("autoscalping", cmd_autoscalping))
     application.add_handler(CommandHandler("screening", cmd_screening))
     application.add_handler(CommandHandler("market", cmd_market))
     application.add_handler(CommandHandler("rekomendasi", cmd_rekomendasi))

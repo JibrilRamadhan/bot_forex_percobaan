@@ -239,6 +239,47 @@ def get_news_for_stock(kode_saham: str, max_articles: int = config.MAX_NEWS_ARTI
     return headlines
 
 
+def get_macro_news(max_articles: int = 5) -> list[str]:
+    """
+    (v5.0) Ambil berita makro ekonomi terkini untuk konteks IHSG dan Auto Scalping.
+    Sumber: CNBC Market, Bisnis Ekonomi, Kontan Makro.
+    """
+    logger.info("[SCRAPER] Mengambil berita Makro Ekonomi Global & IHSG...")
+    
+    macro_sources = [
+        ("CNBC Market", "https://www.cnbcindonesia.com/market/rss"),
+        ("Bisnis Ekonomi", "https://ekonomi.bisnis.com/feed"),
+        ("Kontan Makro", "https://nasional.kontan.co.id/rss/makro.rss"),
+    ]
+    
+    all_articles = []
+    for nama_sumber, url in macro_sources:
+        try:
+            articles = fetch_from_rss(url, timeout=8)
+            if articles:
+                logger.info(f"[SCRAPER] {nama_sumber}: {len(articles)} berita makro ditemukan")
+            all_articles.extend(articles)
+            time.sleep(0.3)
+        except Exception as e:
+            logger.warning(f"[SCRAPER] Error macro sumber {nama_sumber}: {e}")
+            
+    # Hapus duplikat
+    seen_titles = set()
+    unique_headlines = []
+    
+    for article in all_articles:
+        if article["judul"] not in seen_titles:
+            seen_titles.add(article["judul"])
+            unique_headlines.append(article["judul"])
+            
+    if unique_headlines:
+        logger.info(f"[SCRAPER] ✅ {len(unique_headlines[:max_articles])} berita makro berhasil diambil")
+    else:
+        logger.warning("[SCRAPER] ⚠️ Gagal mengambil berita makro.")
+        
+    return unique_headlines[:max_articles]
+
+
 if __name__ == "__main__":
     # Test modul secara standalone
     logging.basicConfig(level=logging.INFO)

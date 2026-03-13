@@ -104,6 +104,29 @@ PANDUAN REKOMENDASI:
 - SELL: Berita negatif atau teknikal melemah
 - STRONG SELL: Berita sangat buruk atau teknikal breakdown"""
 
+AUTOSCALP_SYSTEM_PROMPT = """Kamu adalah Komandan Trading Kuantitatif spesialis Scalping IHSG.
+Tugasmu: Diberikan data berita Makro Ekonomi Global/Nasional dan 1-3 kandidat saham dengan lonjakan volume fantastis. Pilih SATU saham paling sempurna untuk discalping hari ini.
+
+ATURAN KETAT:
+- WAJIB output dalam JSON.
+- Evaluasi pengaruh berita Makro terhadap pasar hari ini.
+- Jika ada berita fundamental/kasus korupsi buruk pada kandidat, coret kandidat tersebut!
+
+FORMAT JSON WAJIB:
+{
+  "market_view": "Analisa singkat cuaca market hari ini berdasarkan berita makro (1 kalimat)",
+  "pemenang_kode": "BBCA",
+  "pemenang_nama": "PT Bank Central Asia",
+  "alasan_menang": "Alasan solid mengapa saham ini menang vs kandidat lain (2 kalimat, sebutkan efek volume/news)",
+  "trading_plan": {
+    "entry_area": "Area harga masuk yang aman (kisaran)",
+    "target_1": "Target take profit awal (+3% s.d +5%)",
+    "target_2": "Target take profit maksimal (+10%)",
+    "stop_loss": "Angka cut loss disiplin (-2% s.d -3%)"
+  },
+  "pesan_psikologi": "Satu pesan disiplin singkat untuk trader"
+}"""
+
 
 def _build_prompt(kode: str, headlines: list[str], tech_context: dict | None = None) -> str:
     numbered = "\n".join(f"{i+1}. {h}" for i, h in enumerate(headlines))
@@ -277,6 +300,85 @@ def _neutral_result(kode: str, n_headlines: int, reason: str = "") -> dict:
 
 def is_signal_approved(sentiment_result: dict) -> bool:
     return sentiment_result.get("sentimen", "Neutral") in ("Bullish", "Neutral")
+
+
+# ----------------------------------------------------------------
+# AUTOSCALPING INFERENCE (v5.0)
+# ----------------------------------------------------------------
+def analyze_autoscalping(candidates: list[dict], macro_news: list[str]) -> dict | None:
+    """
+    Kirim semua kandidat dan berita makro sekaligus ke Llama-3 (Groq) untuk dipilih pemenangnya.
+    Fallbak ke Gemini jika Groq limit.
+    """
+    logger.info("[AI_SCALP] Memulai perumusan Trading Plan AutoScalping...")
+    
+    macro_text = "\n".join(f"- {n}" for n in macro_news) if macro_news else "Tidak ada berita makro terbaru."
+    
+    cand_text = ""
+    for c in candidates:
+        kode = c["kode"]
+        harga = c["harga_terakhir"]
+        pct = c["perubahan_pct"]
+        vol = c["kondisi"]["volume"]["rasio"]
+        rsi = c["kondisi"]["rsi"]["nilai"]
+        score = c["technical_score"]
+        bb = "BREAKOUT SQUEEZE" if c["kondisi"]["bollinger"]["breakout"] else "Normal"
+        
+        # Ambil 3 headline berita khusus perusahaan ini
+        from news_scraper import get_news_for_stock
+        stock_news = get_news_for_stock(kode, max_articles=3)
+        news_str = "\n  - ".join(stock_news) if stock_news else "Tidak ada berita korporasi spesifik terbaru."
+        
+        cand_text += f"\nKANDIDAT: {kode} (Rp {harga:,.0f} | Naik: {pct:.1f}%)\n"
+        cand_text += f"Teknikal: Score {score}/100, RSI {rsi:.1f}, Volume {vol:.1f}x rata-rata, BB {bb}\n"
+        cand_text += f"Berita Korporasi:\n  - {news_str}\n"
+
+    user_prompt = (
+        f"KONDISI MAKRO EKONOMI SAAT INI:\n{macro_text}\n\n"
+        f"DATA KANDIDAT SAHAM SCALPING:\n{cand_text}\n\n"
+        f"Tugas: Tentukan 1 saham pemenang dan buatkan Trading Plan presisi. Output WAJIB JSON."
+    )
+
+    # Coba Groq
+    if config.GROQ_API_KEY:
+        try:
+            client = get_groq_client()
+            chat = client.chat.completions.create(
+                model=config.GROQ_MODEL,
+                messages=[
+                    {"role": "system", "content": AUTOSCALP_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0.2, # Sedikit dinaikkan agar analitis
+                max_tokens=800,
+                response_format={"type": "json_object"},
+            )
+            text = chat.choices[0].message.content.strip()
+            return json.loads(text)
+        except Exception as e:
+            logger.error(f"[AI_SCALP] Groq error: {e}")
+            
+    # Coba Gemini
+    if config.GEMINI_API_KEY:
+        try:
+            client = get_gemini_client()
+            full_prompt = f"{AUTOSCALP_SYSTEM_PROMPT}\n\n{user_prompt}"
+            response = client.models.generate_content(
+                model=config.GEMINI_MODEL,
+                contents=full_prompt,
+                config=types.GenerateContentConfig(
+                    temperature=0.2,
+                    top_p=0.8,
+                    max_output_tokens=800,
+                    response_mime_type="application/json"
+                ),
+            )
+            return json.loads(response.text.strip())
+        except Exception as e:
+            logger.error(f"[AI_SCALP] Gemini error: {e}")
+
+    logger.error("[AI_SCALP] Gagal mendapatkan Trading Plan dari semua AI.")
+    return None
 
 
 # ----------------------------------------------------------------
