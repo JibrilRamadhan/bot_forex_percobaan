@@ -1,7 +1,7 @@
-# IHSG Radar Bot & AI Screener - Dependencies
+# Forex Radar Bot & AI Screener - Dependencies
 # Install dengan: pip install -r requirements.txt
 
-# === Data Saham ===
+# === Data Market ===
 yfinance>=0.2.40
 
 # === Analisa Teknikal ===

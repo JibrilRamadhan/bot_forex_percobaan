@@ -1,13 +1,12 @@
 """
-bot.py - IHSG Radar Bot & AI Screener v2.0
+bot.py - Forex Trading Bot & AI Screener v1.0
 ==========================================
-Fitur Baru v2.0:
-- Auto Chart Generation (candlestick PNG dikirim ke Telegram)
-- ATR Stop Loss + Target Price
-- Bollinger Bands Squeeze alert
-- Multi-Timeframe confirmation
+Fitur:
+- Auto Chart Generation untuk Forex
+- Pip Calculation Risk Management (ATR)
+- Macro Trend (1H/4H Correlation)
 - Final Recommendation (STRONG BUY / BUY / HOLD / SELL / STRONG SELL)
-- Technical Score 0-100
+- Peringatan Volatilitas DXY & Berita Red Folder
 """
 
 import asyncio
@@ -36,10 +35,10 @@ import config
 from config import validate_config, WIB
 from data_fetcher import (
     full_screening, format_ticker, get_clean_code,
-    scan_kompas100_buy, scan_kompas100_danger,
+    scan_forex_buy, scan_forex_danger,
     get_market_leaders, get_autoscalping_candidates
 )
-from news_scraper import get_news_for_stock, get_macro_news
+from news_scraper import get_news_for_forex, get_macro_news
 from ai_analyzer import (
     analyze_sentiment, is_signal_approved, get_final_recommendation,
     analyze_autoscalping
@@ -140,7 +139,7 @@ def generate_chart(df: pd.DataFrame, kode: str, screening_data: dict) -> io.Byte
         tech_score = screening_data.get("technical_score", 0)
         harga = screening_data.get("harga_terakhir", 0)
         waktu = datetime.now(WIB).strftime("%d %b %Y %H:%M WIB")
-        title = f"{kode} | Rp {harga:,.0f} | Score: {tech_score}/100 | {waktu}"
+        title = f"{kode} | {harga:.5f} | Score: {tech_score}/100 | {waktu}"
 
         buf = io.BytesIO()
         fig, axes = mpf.plot(
@@ -238,17 +237,18 @@ def build_screening_message(screening_data: dict, sentiment_data: dict, headline
     # Multi-timeframe
     mtf_uptrend = daily.get("uptrend_daily", False)
     pct_vs_ema20d = daily.get("harga_vs_ema20d", 0)
-    mtf_status = (f"{EMOJI['chart_up']} UPTREND Harian ({pct_vs_ema20d:+.1f}% vs EMA20D) ✅ Konfirmasi Valid"
+    mtf_status = (f"{EMOJI['chart_up']} UPTREND Makro ({pct_vs_ema20d:+.2f}% vs EMA20D) ✅"
                   if mtf_uptrend else
-                  f"{EMOJI['chart_down']} Di bawah EMA20D ({pct_vs_ema20d:+.1f}%) ⚠️ Waspadai False Breakout")
+                  f"{EMOJI['chart_down']} Di bawah EMA20D Makro ({pct_vs_ema20d:+.2f}%) ⚠️ Hati-hati trend balik")
 
-    # Stop Loss & Target
+    # Stop Loss & Target (Pips)
     sl = risk.get("stop_loss", 0)
     tp = risk.get("target_price", 0)
     rr = risk.get("risk_reward", 0)
     atr = risk.get("atr", 0)
-    sl_str = f"Rp {sl:,.0f} (1.5× ATR={atr:.0f})" if sl > 0 else "N/A"
-    tp_str = f"Rp {tp:,.0f} (2.0× ATR)" if tp > 0 else "N/A"
+    sl_pips = risk.get("risiko_pips", 0)
+    sl_str = f"{sl:.5f} ({sl_pips:.1f} Pips)" if sl > 0 else "N/A"
+    tp_str = f"{tp:.5f}" if tp > 0 else "N/A"
     rr_str = f"1 : {rr:.1f}" if rr > 0 else "N/A"
 
     # Berita
@@ -260,10 +260,10 @@ def build_screening_message(screening_data: dict, sentiment_data: dict, headline
     cache_note = " <i>(cached)</i>" if dari_cache else ""
 
     msg = f"""
-{EMOJI['radar']} <b>SCREENING: {kode}</b> | <i>{nama}</i> | <i>by Jibril</i>
+{EMOJI['radar']} <b>INFORMASI PAIR: {kode}</b> | <i>{nama}</i> | <i>by Jibril</i>
 ━━━━━━━━━━━━━━━━━━━━━━━━
 
-{EMOJI['money']} Harga: <code>Rp {harga:,.0f}</code> {perubahan_emoji} {perubahan_str}
+{EMOJI['money']} Harga: <code>{harga:.5f}</code> {perubahan_emoji} {perubahan_str}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━
 {score_color} <b>TECHNICAL SCORE: {tech_score}/100</b>
@@ -301,9 +301,9 @@ def build_screening_message(screening_data: dict, sentiment_data: dict, headline
 ━━━━━━━━━━━━━━━━━━━━━━━━
 {EMOJI['target']} <b>SUPPORT & RESISTANCE</b>
 ━━━━━━━━━━━━━━━━━━━━━━━━
-🔴 R2: <code>Rp {pivot.get('R2', 0):,.0f}</code> | 🟠 R1: <code>Rp {pivot.get('R1', 0):,.0f}</code>
-⚪ PP: <code>Rp {pivot.get('PP', 0):,.0f}</code>
-🟢 S1: <code>Rp {pivot.get('S1', 0):,.0f}</code> | 🔵 S2: <code>Rp {pivot.get('S2', 0):,.0f}</code>
+🔴 R2: <code>{pivot.get('R2', 0):.5f}</code> | 🟠 R1: <code>{pivot.get('R1', 0):.5f}</code>
+⚪ PP: <code>{pivot.get('PP', 0):.5f}</code>
+🟢 S1: <code>{pivot.get('S1', 0):.5f}</code> | 🔵 S2: <code>{pivot.get('S2', 0):.5f}</code>
 
 ━━━━━━━━━━━━━━━━━━━━━━━━
 🏁 <b>REKOMENDASI FINAL:</b> {reko_label}
@@ -373,14 +373,14 @@ def build_signal_alert_message(screening_data: dict, sentiment_data: dict) -> st
 💬 <i>{alasan}</i>
 
 ━━━━━━━━━━━━━━━━━━━━━━━━
-{EMOJI['shield']} <b>MANAJEMEN RISIKO</b>
+{EMOJI['shield']} <b>MANAJEMEN RISIKO (PIPS)</b>
 ━━━━━━━━━━━━━━━━━━━━━━━━
-🛑 Stop Loss: <code>Rp {sl:,.0f}</code> (1.5× ATR)
-{EMOJI['target']} Target: <code>Rp {tp:,.0f}</code>
+🛑 Stop Loss: <code>{sl:.5f}</code> ({risk.get('risiko_pips', 0):.1f} Pips)
+{EMOJI['target']} Target: <code>{tp:.5f}</code> ({risk.get('potensi_pips', 0):.1f} Pips)
 ⚖️ Risk/Reward: <b>1 : {rr:.1f}</b>
 
 ━━━━━━━━━━━━━━━━━━━━━━━━
-{EMOJI['target']} S/R | R1: <code>Rp {pivot.get('R1',0):,.0f}</code> | PP: <code>Rp {pivot.get('PP',0):,.0f}</code> | S1: <code>Rp {pivot.get('S1',0):,.0f}</code>
+{EMOJI['target']} S/R | R1: <code>{pivot.get('R1',0):.5f}</code> | PP: <code>{pivot.get('PP',0):.5f}</code> | S1: <code>{pivot.get('S1',0):.5f}</code>
 
 🏁 <b>REKOMENDASI: {reko_label}</b>
 
@@ -401,28 +401,28 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         [InlineKeyboardButton("📊 Contoh Screening BBCA", callback_data="screen_BBCA")],
     ]
     pesan = f"""
-{EMOJI['rocket']} <b>Selamat datang, {html.escape(nama)}!</b>
+{EMOJI['rocket']} <b>Selamat datang, {html.escape(nama)} di Dunia Forex!</b>
 
-{EMOJI['radar']} <b>IHSG Radar Bot & AI Screener v3.0</b>
+{EMOJI['radar']} <b>Forex Daily Scalper & AI Screener</b>
 
 ━━━━━━━━━━━━━━━━━━━━━━━━
-{EMOJI['star']} <b>FITUR BARU v3.0</b>
+{EMOJI['star']} <b>FITUR ANDALAN</b>
 ━━━━━━━━━━━━━━━━━━━━━━━━
-📊 Auto Chart Candlestick (PNG ke Telegram)
-🛡️ ATR Stop Loss + Target Price otomatis
-⚡ Bollinger Bands Squeeze Detection
-🌐 Multi-Timeframe (filter 80% sinyal palsu)
-🏁 Rekomendasi: STRONG BUY / BUY / HOLD / SELL
+📊 Auto Chart Candlestick
+🛡️ PIPs Auto Calculation untuk Stop Loss
+⚡ Volatility & Macro Trend Checks
+🌐 Berita Fundamental Real-Time
+🏁 Rekomendasi AI Profesional
 
 ━━━━━━━━━━━━━━━━━━━━━━━━
 📋 <b>PERINTAH UTAMA</b>
 ━━━━━━━━━━━━━━━━━━━━━━━━
-/autoscalping — AI Trading Plan (Terbaik)
-/autoscalpingforce — Paksa AI mencari saham terbaik (High Risk)
-/screening [KODE] — Analisa saham + Chart
-/market — Live Gainers, Volume, Value, Rebound
-/rekomendasi — Top BUY dari Kompas100
-/danger — Saham drop ekstrim hari ini
+/autoscalping — AI Trading Plan (Setup Terbaik)
+/autoscalpingforce — Paksa AI buat setup (High Risk)
+/screening [PAIR] — Analisa pair (contoh: EURUSD=X)
+/heatmap — Live pergerakan Major/Crosses
+/signals — Top BUY/SELL candidate
+/danger — Pair dengan Volatilitas Berbahaya
 /watchlist — Daftar pantauan radar
 /help — Panduan lengkap
 """.strip()
@@ -432,38 +432,21 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     pesan = f"""
-{EMOJI['info']} <b>PANDUAN PENGGUNAAN v3.0</b>
+{EMOJI['info']} <b>PANDUAN PENGGUNAAN FOREX BOT</b>
 ━━━━━━━━━━━━━━━━━━━━━━━━
 
 {EMOJI['chart_up']} <b>Screening & Rekomendasi:</b>
-<code>/autoscalping</code> — AI pilihkan 1 saham scalping terbaik + Trading Plan murni! (v5.0)
-<code>/autoscalpingforce</code> — Paksa AI mencari saham terbaik saat kondisi tidak ada yang ideal.
-<code>/screening KODE</code> — Analisa AI & Chart
-<code>/market</code> — Top Gainers, Vol, Value & Rebound
-<code>/rekomendasi</code> — Sinyal BUY terbaik hr ini
-<code>/danger</code> — Hindari saham merah / drop
+<code>/autoscalping</code> — AI pilihkan 1 setup scalping terbaik!
+<code>/autoscalpingforce</code> — Paksa AI jika Anda agresif.
+<code>/screening PAIR</code> — Contoh: EURUSD=X atau GBPAUD=X
+<code>/heatmap</code> — Pantau mata uang mana yang paling aktif
+<code>/signals</code> — Sinyal BUY terbaik hr ini
+<code>/danger</code> — Hindari pergerakan ekstrem/news spike
 
 ━━━━━━━━━━━━━━━━━━━━━━━━
-📊 <b>Technical Score 0-100:</b>
-🟢 70-100: Strong signal
-🟡 45-69: Wait and watch  
-🔴 0-44: Hindari / Cut Loss
-
-━━━━━━━━━━━━━━━━━━━━━━━━
-🛡️ <b>ATR Stop Loss:</b>
-Stop loss dihitung otomatis: <code>Harga - (1.5 × ATR)</code>
-Target Price: <code>Harga + (2.0 × ATR)</code>
-Jangan hold di bawah stop loss!
-
-━━━━━━━━━━━━━━━━━━━━━━━━
-⚡ <b>Bollinger Bands Squeeze:</b>
-Squeeze = saham sedang "ngumpet" energi
-Breakout + Volume Surge = sinyal A++ 🔥
-
-━━━━━━━━━━━━━━━━━━━━━━━━
-🌐 <b>Multi-Timeframe:</b>
-Sinyal 15m valid HANYA jika trend harian juga naik
-(harga > EMA20 Daily). Filter sinyal palsu!
+🛡️ <b>Manejemen Risiko (Pips):</b>
+Stop loss dihitung berdasarkan ATR dan Quote Currency.
+Amankan profit Anda!
 
 ━━━━━━━━━━━━━━━━━━━━━━━━
 {EMOJI['warning']} <i>Bot ini adalah alat bantu. BUKAN rekomendasi resmi. DYOR! by JR</i>
@@ -472,25 +455,25 @@ Sinyal 15m valid HANYA jika trend harian juga naik
 
 
 async def cmd_watchlist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    n = len(config.KOMPAS100)
-    # Tampilkan 20 saham pertama sebagai preview
-    preview = " | ".join(f"<code>{k}</code>" for k in config.KOMPAS100[:20])
+    n = len(config.FOREX_WATCHLIST)
+    # Tampilkan 20 instrumen pertama sebagai preview
+    preview = " | ".join(f"<code>{k}</code>" for k in config.FOREX_WATCHLIST[:20])
     pesan = f"""
-{EMOJI['radar']} <b>WATCHLIST RADAR v3.0</b>
+{EMOJI['radar']} <b>WATCHLIST FOREX & COMMODITY</b>
 ━━━━━━━━━━━━━━━━━━━━━━━━
 
-📡 Radar memantau <b>{n} saham</b> Kompas100 (paling liquid BEI)
+📡 Radar memantau <b>{n} instrumen</b> (Majors, Crosses, Gold, Oil)
 
-<b>Preview 20 saham pertama:</b>
+<b>Preview:</b>
 {preview}
-<i>... dan {n - 20} saham lainnya</i>
+<i>... dan {max(0, n - 20)} instrumen lainnya</i>
 
 ━━━━━━━━━━━━━━━━━━━━━━━━
-{EMOJI['clock']} Interval: <b>{config.RADAR_INTERVAL_MINUTES} menit</b>
-{EMOJI['chart_up']} Jam aktif: <b>09:00 – 16:00 WIB</b>
-{EMOJI['lightning']} Filter: Crossover + Volume Surge + Daily Uptrend
+{EMOJI['clock']} Sesi: <b>Tokyo / London / New York</b>
+{EMOJI['chart_up']} Waktu aktif: <b>24 Jam (Senin-Jumat)</b>
+{EMOJI['lightning']} Filter: Crossover + Volume Surge + Daily Trend
 
-💡 <i>Gunakan /rekomendasi untuk top BUY hari ini</i>
+💡 <i>Gunakan /signals untuk top BUY hari ini</i>
 """.strip()
     await update.message.reply_text(pesan, parse_mode=ParseMode.HTML)
 
@@ -498,25 +481,28 @@ async def cmd_watchlist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 async def cmd_screening(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     # ── Jika tidak ada argumen → tampilkan pilihan saham populer ──
     if not context.args:
-        # Buat grid tombol dari 20 saham teratas Kompas100
-        saham_populer = config.KOMPAS100[:24]  # 24 saham = 6 baris × 4 kolom
+        # Buat grid tombol dari 24 instrumen teratas
+        instrumen_populer = config.FOREX_WATCHLIST[:24]  # 24 pair = 6 baris × 4 kolom
         tombol_rows = []
-        for i in range(0, len(saham_populer), 4):
+        for i in range(0, len(instrumen_populer), 4):
             row = [
                 InlineKeyboardButton(k, callback_data=f"screen_{k}")
-                for k in saham_populer[i:i+4]
+                for k in instrumen_populer[i:i+4]
             ]
             tombol_rows.append(row)
 
         await update.message.reply_text(
-            f"{EMOJI['radar']} <b>Pilih saham untuk dianalisa:</b>\n"
-            f"<i>Atau ketik: /screening KODE (contoh: /screening INET)</i>",
+            f"{EMOJI['radar']} <b>Pilih pair untuk dianalisa:</b>\n"
+            f"<i>Atau ketik: /screening KODE (contoh: /screening EURUSD=X)</i>",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup(tombol_rows),
         )
         return
 
-    kode_input = context.args[0].strip().upper().replace(".JK", "")
+    kode_input = context.args[0].strip().upper().replace(".JK", "").replace("=X", "")
+    # Add back =X for fetcher
+    if len(kode_input) == 6:
+        kode_input = f"{kode_input}=X"
     await update.message.reply_chat_action("typing")
 
     loading_msg = await update.message.reply_text(
@@ -532,16 +518,16 @@ async def cmd_screening(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             if screening_data is None:
                 await loading_msg.edit_text(
                     f"{EMOJI['cross']} Gagal mengambil data <b>{kode_input}</b>.\n"
-                    f"Pastikan kode saham BEI valid.",
+                    f"Pastikan pair valid (e.g., EURUSD=X).",
                     parse_mode=ParseMode.HTML)
                 return
 
             # Step 2: News
             await loading_msg.edit_text(
-                f"{EMOJI['news']} <b>[2/4]</b> Mengumpulkan berita dari 4+ sumber (Async)...\n"
+                f"{EMOJI['news']} <b>[2/4]</b> Mengumpulkan berita fundamental...\n"
                 f"<i>(Hanya butuh 1-3 detik)</i>",
                 parse_mode=ParseMode.HTML)
-            headlines = await get_news_for_stock(kode_input)
+            headlines = await get_news_for_forex(kode_input)
 
             # Step 3: AI Analysis with technical context
             await loading_msg.edit_text(
@@ -573,7 +559,7 @@ async def cmd_screening(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                     screening_data.get("technical_score", 0), sentiment_data)
                 reko_label = reko_data["label"]
                 caption_pendek = (
-                    f"📊 <b>{kode_input}</b> | Rp {screening_data['harga_terakhir']:,.0f} "
+                    f"📊 <b>{kode_input}</b> | {screening_data['harga_terakhir']:.5f} "
                     f"| Score: {screening_data.get('technical_score', 0)}/100\n"
                     f"🏁 <b>{reko_label}</b>"
                 )
@@ -608,24 +594,24 @@ async def cmd_screening(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 # ----------------------------------------------------------------
-# /REKOMENDASI
+# /SIGNALS
 # ----------------------------------------------------------------
-async def cmd_rekomendasi(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Scan Kompas100 dan tampilkan top kandidat BUY hari ini."""
+async def cmd_signals(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Scan Forex dan tampilkan top kandidat BUY/SELL hari ini."""
     await update.message.reply_chat_action("typing")
     msg = await update.message.reply_text(
-        f"{EMOJI['radar']} Scanning <b>{len(config.KOMPAS100)} saham</b> Kompas100 untuk kandidat BUY..."
-        f"\n<i>Proses sekitar 30-60 detik...</i>",
+        f"{EMOJI['radar']} Scanning <b>{len(config.FOREX_WATCHLIST)} instrumen</b> untuk kandidat BUY..."
+        f"\n<i>Proses sekitar 30 detik...</i>",
         parse_mode=ParseMode.HTML)
 
     try:
         candidates = await asyncio.get_event_loop().run_in_executor(
-            None, scan_kompas100_buy, config.KOMPAS100)
+            None, scan_forex_buy, config.FOREX_WATCHLIST)
 
         if not candidates:
             await msg.edit_text(
-                f"{EMOJI['info']} Tidak ada kandidat BUY saat ini.\n"
-                f"Filter: naik +{config.VOLATILITY_MIN_PCT}%-{config.VOLATILITY_MAX_PCT}% + volume surge + score ≥{config.TECHNICAL_SCORE_BUY}.",
+                f"{EMOJI['info']} Tidak ada kandidat signal kuat saat ini.\n"
+                f"Filter: Volatilitas tinggi + volume surge + AI Sentiment.",
                 parse_mode=ParseMode.HTML)
             return
 
@@ -644,15 +630,15 @@ async def cmd_rekomendasi(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             bar = "█" * filled + "░" * (10 - filled)
             baris.append(
                 f"<b>{i}. {kode}</b>{bb_txt}\n"
-                f"   💰 <code>Rp {harga:,.0f}</code> 📈 <b>+{pct:.1f}%</b> | Vol ×{vol_ratio:.1f}\n"
+                f"   💰 <code>{harga:.5f}</code> 📈 <b>+{pct:.2f}%</b> | Vol ×{vol_ratio:.1f}\n"
                 f"   [{bar}] <b>{score}/100</b>\n"
-                f"   🛑 SL: <code>Rp {sl:,.0f}</code> | 🎯 TP: <code>Rp {tp:,.0f}</code>"
+                f"   🛑 SL: <code>{sl:.5f}</code> | 🎯 TP: <code>{tp:.5f}</code>"
             )
 
         teks = (
-            f"{EMOJI['rocket']} <b>TOP KANDIDAT BUY HARI INI</b>\n"
-            f"Dari {len(config.KOMPAS100)} saham Kompas100\n"
-            f"Filter: naik +{config.VOLATILITY_MIN_PCT}%-{config.VOLATILITY_MAX_PCT}% + Volume Surge\n"
+            f"{EMOJI['rocket']} <b>TOP KANDIDAT SETUP HARI INI</b>\n"
+            f"Dari {len(config.FOREX_WATCHLIST)} instrumen dipantau\n"
+            f"Filter: Volume/Volatility Breakout\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
             + "\n\n".join(baris)
             + f"\n\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -670,21 +656,21 @@ async def cmd_rekomendasi(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 # /DANGER
 # ----------------------------------------------------------------
 async def cmd_danger(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Scan Kompas100 dan tampilkan saham berbahaya/merah hari ini."""
+    """Scan Forex untuk mendeteksi Drop / Volatilitas bahaya."""
     await update.message.reply_chat_action("typing")
     msg = await update.message.reply_text(
-        f"{EMOJI['warning']} Scanning <b>{len(config.KOMPAS100)} saham</b> Kompas100 untuk deteksi bahaya..."
-        f"\n<i>Proses sekitar 30-60 detik...</i>",
+        f"{EMOJI['warning']} Scanning <b>{len(config.FOREX_WATCHLIST)} instrumen</b> untuk deteksi bahaya berita Red Folder..."
+        f"\n<i>Proses sekitar 30 detik...</i>",
         parse_mode=ParseMode.HTML)
 
     try:
         dangerous = await asyncio.get_event_loop().run_in_executor(
-            None, scan_kompas100_danger, config.KOMPAS100)
+            None, scan_forex_danger, config.FOREX_WATCHLIST)
 
         if not dangerous:
             await msg.edit_text(
-                f"{EMOJI['check']} Tidak ada saham yang memasuki zona bahaya saat ini.\n"
-                f"Pasar relatif aman hari ini! {EMOJI['bullish']}",
+                f"{EMOJI['check']} Tidak ada instrumen yang memasuki zona bahaya saat ini.\n"
+                f"Pasar Forex relatif stabil! {EMOJI['bullish']}",
                 parse_mode=ParseMode.HTML)
             return
 
@@ -697,23 +683,23 @@ async def cmd_danger(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             score = d["technical_score"]
             rsi = d["kondisi"]["rsi"]["nilai"]
             dtype = d.get("danger_type", "DROP")
-            badge = "💥 DROP BESAR" if dtype == "DROP" else "🔥 OVERBOUGHT"
+            badge = "💥 DROP BESAR / FLASH CRASH" if dtype == "DROP" else "🔥 OVERBOUGHT MAKSIMAL"
             vol_ratio = d["kondisi"]["volume"]["rasio"]
             baris.append(
                 f"<b>{i}. {kode}</b> — {badge}\n"
-                f"   💰 <code>Rp {harga:,.0f}</code> 📉 <b>{pct:+.1f}%</b>\n"
+                f"   💰 <code>{harga:.5f}</code> 📉 <b>{pct:+.2f}%</b>\n"
                 f"   RSI: {rsi:.1f} | Vol ×{vol_ratio:.1f} | Score: {score}/100"
             )
 
         teks = (
-            f"{EMOJI['warning']} <b>RADAR BAHAYA — SAHAM MERAH HARI INI</b>\n"
-            f"Dari {len(config.KOMPAS100)} saham Kompas100\n"
-            f"Kriteria: Turun ≥{abs(config.DANGER_DROP_PCT):.1f}% atau RSI Overbought ekstrem\n"
+            f"{EMOJI['warning']} <b>RADAR BAHAYA — FLASH VOLATILITY</b>\n"
+            f"Dari {len(config.FOREX_WATCHLIST)} instrumen Forex\n"
+            f"Kriteria: Turun ekstrem atau oversold/overbought kuat.\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
             + "\n\n".join(baris)
             + f"\n\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"{EMOJI['clock']} {waktu}\n"
-            f"{EMOJI['info']} <i>Hindari masuk posisi pada saham di atas! by JR {EMOJI['shield']}</i>"
+            f"{EMOJI['info']} <i>Hindari masuk posisi pada instrumen di atas! by JR {EMOJI['shield']}</i>"
         )
         await msg.edit_text(teks, parse_mode=ParseMode.HTML)
 
@@ -723,19 +709,19 @@ async def cmd_danger(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 # ----------------------------------------------------------------
-# /MARKET (v4.0)
+# /HEATMAP (MENGGANTIKAN /MARKET)
 # ----------------------------------------------------------------
-async def cmd_market(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Tampilkan Ringkasan Top Gainer, Top Volume, Top Value, dan Live Rebound."""
+async def cmd_heatmap(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Tampilkan Ringkasan Volatilitas Mata Uang / Pasangan Mata uang."""
     await update.message.reply_chat_action("typing")
     msg = await update.message.reply_text(
-        f"{EMOJI['radar']} Mengambil data Market Leaders dari <b>{len(config.KOMPAS100)} saham</b> Kompas100..."
+        f"{EMOJI['radar']} Mengumpulkan data Heatmap Market dari <b>{len(config.FOREX_WATCHLIST)} instrumen</b>..."
         f"\n<i>Proses sekitar 5-10 detik...</i>",
         parse_mode=ParseMode.HTML)
 
     try:
         data = await asyncio.get_event_loop().run_in_executor(
-            None, get_market_leaders, config.KOMPAS100)
+            None, get_market_leaders, config.FOREX_WATCHLIST)
 
         if not data:
             await msg.edit_text(f"{EMOJI['cross']} Gagal mengambil data market.", parse_mode=ParseMode.HTML)
@@ -744,48 +730,40 @@ async def cmd_market(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         waktu = datetime.now(WIB).strftime("%d %b %Y, %H:%M WIB")
         
         # Helper format
-        def format_currency(val):
-            if val >= 1e12:
-                return f"Rp {val/1e12:.1f}T"
-            elif val >= 1e9:
-                return f"Rp {val/1e9:.1f}M"
-            else:
-                return f"Rp {val:,.0f}"
-
         def format_vol(val):
             if val >= 1e6:
-                return f"{val/1e6:.1f}Jt"
+                return f"{val/1e6:.1f}M"
             elif val >= 1e3:
-                return f"{val/1e3:.0f}Rb"
+                return f"{val/1e3:.0f}K"
             return f"{val:,.0f}"
 
-        txt = f"🌐 <b>MARKET LEADERS KOMPAS100</b>\n"
+        txt = f"🌐 <b>FOREX HEATMAP</b>\n"
         txt += f"<i>Update: {waktu}</i>\n"
         txt += f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
 
         # 1. Top Gainers
-        txt += f"🚀 <b>TOP GAINERS (Hari Ini)</b>\n"
+        txt += f"🚀 <b>MOST BULLISH PAIRS</b>\n"
         if data.get("top_gainer"):
             for i, x in enumerate(data["top_gainer"], 1):
-                txt += f"{i}. <b>{x['kode']}</b> :  Rp {x['harga']:,.0f} (<b>+{x['change_pct']:.1f}%</b>)\n"
+                txt += f"{i}. <b>{x['kode']}</b> :  {x['harga']:.5f} (<b>+{x['change_pct']:.2f}%</b>)\n"
         else:
             txt += "<i>Belum ada data...</i>\n"
         txt += "\n"
 
         # 2. Live Rebound
-        txt += f"🟢 <b>LIVE REBOUND (Sentuh Support & Naik)</b>\n"
+        txt += f"🟢 <b>REBOUNDING PAIRS (Sentuh Support)</b>\n"
         if data.get("live_rebound"):
             for i, x in enumerate(data["live_rebound"], 1):
-                txt += f"{i}. <b>{x['kode']}</b> :  Rp {x['harga']:,.0f} (<b>+{x['change_pct']:.1f}%</b>)\n"
+                txt += f"{i}. <b>{x['kode']}</b> :  {x['harga']:.5f} (<b>+{x['change_pct']:.2f}%</b>)\n"
         else:
-            txt += "<i>Tidak ada saham yang rebound hari ini...</i>\n"
+            txt += "<i>Tidak ada pair yang rebound saat ini...</i>\n"
         txt += "\n"
 
-        # 3. Top Value
-        txt += f"💸 <b>TOP TRANSAKSI (Rp Value)</b>\n"
-        if data.get("top_value"):
-            for i, x in enumerate(data["top_value"], 1):
-                txt += f"{i}. <b>{x['kode']}</b> :  {format_currency(x['value'])}\n"
+        # 3. Top Value -> kita jadikan Momentum / Volatility terbesar (Volume Proxy)
+        txt += f"💸 <b>ALGORITMA DETEKSI MOMENTUM TINGGI</b>\n"
+        if data.get("top_volume"):
+            for i, x in enumerate(data["top_volume"], 1):
+                txt += f"{i}. <b>{x['kode']}</b> :  Volatility Surge Detected\n"
         else:
             txt += "<i>Belum ada data...</i>\n"
         txt += "\n"
@@ -794,7 +772,7 @@ async def cmd_market(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         txt += f"📊 <b>TOP VOLUME TRANSAKSI</b>\n"
         if data.get("top_volume"):
             for i, x in enumerate(data["top_volume"], 1):
-                txt += f"{i}. <b>{x['kode']}</b> :  {format_vol(x['volume'])} lbr\n"
+                txt += f"{i}. <b>{x['kode']}</b> :  {format_vol(x['volume'])}\n"
         else:
             txt += "<i>Belum ada data...</i>\n"
 
@@ -809,27 +787,27 @@ async def cmd_market(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 # ----------------------------------------------------------------
-# /AUTOSCALPING (v5.0) - The Ultimate AI Trading Plan
+# /AUTOSCALPING (v6.0) - AI Trading Plan Forex
 # ----------------------------------------------------------------
 async def _run_autoscalping(update: Update, context: ContextTypes.DEFAULT_TYPE, force: bool = False) -> None:
     await update.message.reply_chat_action("typing")
-    msg_text = f"{EMOJI['radar']} <b>Fase 1/3:</b> Filter Kuantitatif Ketat dari {len(config.KOMPAS100)} saham..."
+    msg_text = f"{EMOJI['radar']} <b>Fase 1/3:</b> Filter Kuantitatif Ketat dari {len(config.FOREX_WATCHLIST)} instrumen..."
     if force:
-        msg_text = f"{EMOJI['radar']} <b>Fase 1/3:</b> Filter Kuantitatif (Mode FORCE) dari {len(config.KOMPAS100)} saham..."
+        msg_text = f"{EMOJI['radar']} <b>Fase 1/3:</b> Filter Kuantitatif (Mode FORCE) dari {len(config.FOREX_WATCHLIST)} instrumen..."
         
     msg = await update.message.reply_text(msg_text, parse_mode=ParseMode.HTML)
 
     try:
         # FASE 1: Filter Kuantitatif
         candidates = await asyncio.get_event_loop().run_in_executor(
-            None, get_autoscalping_candidates, config.KOMPAS100, force)
+            None, get_autoscalping_candidates, config.FOREX_WATCHLIST, force)
             
         if not candidates:
             await msg.edit_text(
                 f"🤷‍♂️ <b>Tidak ada kandidat sempurna saat ini.</b>\n"
-                f"Pasar tidak sedang memberikan setup scalping yang aman (Volume kurang, atau RSI jelek). "
-                f"<i>Cash is King!</i>\n\n"
-                f"💡 <i>Gunakan /autoscalpingforce jika Anda tetap ingin memaksa AI mencari saham dengan probabilitas paling tinggi saat ini (High Risk).</i>", 
+                f"Pasar tidak sedang memberikan setup scalping yang jelas (Volume sepi/Trend campur). "
+                f"<i>Lindungi modalmu!</i>\n\n"
+                f"💡 <i>Gunakan /autoscalpingforce jika Anda agresif (High Risk).</i>", 
                 parse_mode=ParseMode.HTML)
             return
 
@@ -866,11 +844,8 @@ async def _run_autoscalping(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         psikologi = ai_plan.get("pesan_psikologi", "")
         
         # Validasi format kode
-        if not kode.endswith(".JK"):
-            kode_jk = f"{kode}.JK"
-        else:
-            kode_jk = kode
-            kode = kode.replace(".JK", "")
+        kode_ticker = format_ticker(kode)
+        kode = get_clean_code(kode_ticker)
 
         force_badge = " (FORCE MODE ⚠️ HIGH RISK)" if force else ""
         teks = (
@@ -878,7 +853,7 @@ async def _run_autoscalping(update: Update, context: ContextTypes.DEFAULT_TYPE, 
             f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"🌐 <b>Market Hari Ini:</b> {market_view}\n\n"
             
-            f"🎯 <b>SAHAM TERPILIH: {kode}</b>\n"
+            f"🎯 <b>PAIR TERPILIH: {kode}</b>\n"
             f"<i>{nama}</i>\n"
             f"💡 <b>Strategi:</b> {alasan}\n\n"
             
@@ -911,7 +886,7 @@ async def _run_autoscalping(update: Update, context: ContextTypes.DEFAULT_TYPE, 
             df = cand_dict[kode]["df"]
             score = cand_dict[kode]["technical_score"]
             photo_io = await asyncio.get_event_loop().run_in_executor(
-                None, generate_chart, df, kode_jk, cand_dict[kode])
+                None, generate_chart, df, kode_ticker, cand_dict[kode])
             if photo_io:
                 await context.bot.send_photo(
                     chat_id=update.effective_chat.id,
@@ -925,11 +900,11 @@ async def _run_autoscalping(update: Update, context: ContextTypes.DEFAULT_TYPE, 
 
 
 async def cmd_autoscalping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Scan Kompas100 secara kuantitatif, lalu biarkan AI membuat Trading Plan."""
+    """Scan Forex secara kuantitatif, lalu AI membuat Trading Plan."""
     await _run_autoscalping(update, context, force=False)
 
 async def cmd_autoscalping_force(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Scan Kompas100 dan paksa AI membuat Trading Plan meskipun tidak ideal."""
+    """Scan Forex dan paksa AI mencari setup terbaik meskipun kurang ideal."""
     await _run_autoscalping(update, context, force=True)
 
 
@@ -964,14 +939,14 @@ async def radar_scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     waktu = datetime.now(WIB).strftime("%H:%M WIB")
-    n = len(config.WATCHLIST)
-    logger.info(f"[RADAR] 🔍 Scan {n} saham Kompas100 — {waktu}")
+    n = len(config.FOREX_WATCHLIST)
+    logger.info(f"[RADAR] 🔍 Scan {n} pair Forex — {waktu}")
 
-    # ── FASE 1: Bulk Download semua saham sekaligus (1 request) ──
+    # ── FASE 1: Bulk Download semua pair sekaligus (1 request) ──
     from data_fetcher import bulk_fetch_ohlcv, quick_scan
     data_map = await asyncio.get_event_loop().run_in_executor(
-        None, bulk_fetch_ohlcv, config.WATCHLIST)
-    logger.info(f"[RADAR] Bulk download selesai: {len(data_map)}/{n} saham")
+        None, bulk_fetch_ohlcv, config.FOREX_WATCHLIST)
+    logger.info(f"[RADAR] Bulk download selesai: {len(data_map)}/{n} instrumen")
 
     # ── FASE 2: Quick scan — filter awal yang ringan ──
     kandidat = []
@@ -996,10 +971,10 @@ async def radar_scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
             # Filter multi-timeframe: hanya alert jika daily uptrend
             if not data.get("daily_trend", {}).get("uptrend_daily", False):
-                logger.info(f"[RADAR] {kode}: daily downtrend → skip")
+                logger.info(f"[RADAR] {kode}: daily downtrend/sideways → skip")
                 continue
 
-            headlines = await get_news_for_stock(kode)
+            headlines = await get_news_for_forex(kode)
             tech_ctx = {
                 "technical_score": data.get("technical_score", 0),
                 "rsi": data["kondisi"]["rsi"]["nilai"],
@@ -1042,7 +1017,7 @@ async def radar_scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         except Exception as e:
             logger.error(f"[RADAR] Error {kode}: {e}")
 
-    logger.info(f"[RADAR] Selesai. {sinyal} sinyal dari {n} saham.")
+    logger.info(f"[RADAR] Selesai. {sinyal} sinyal dari {n} pasang mata uang/komoditas.")
 
 
 # ----------------------------------------------------------------
@@ -1073,13 +1048,13 @@ async def post_init(application: Application) -> None:
     logger.info("[BOT] ✅ Terhubung ke Telegram.")
     commands = [
         BotCommand("start", "Menu utama"),
-        BotCommand("autoscalping", "AI Trading Plan Otomatis (v5.0)"),
-        BotCommand("autoscalpingforce", "Paksa AI mencari saham terbaik (High Risk)"),
-        BotCommand("screening", "Analisa + Chart saham (contoh: /screening INET)"),
-        BotCommand("market", "Data Top Gainer, Vol, Value & Rebound"),
-        BotCommand("rekomendasi", "Top saham kandidat BUY hari ini dari Kompas100"),
-        BotCommand("danger", "Radar saham berbahaya/merah hari ini"),
-        BotCommand("watchlist", "Daftar saham radar"),
+        BotCommand("autoscalping", "AI Trading Plan Otomatis (v6.0)"),
+        BotCommand("autoscalpingforce", "Paksa AI mencari setup scalping (High Risk)"),
+        BotCommand("screening", "Analisa + Chart (contoh: /screening EURUSD)"),
+        BotCommand("heatmap", "Data volatilitas Major dan Crosses"),
+        BotCommand("signals", "Top pair kandidat BUY/SELL"),
+        BotCommand("danger", "Peringatan Drop/Red Folder"),
+        BotCommand("watchlist", "Pantauan instrumen"),
         BotCommand("help", "Panduan penggunaan"),
     ]
     await application.bot.set_my_commands(commands)
@@ -1087,8 +1062,8 @@ async def post_init(application: Application) -> None:
 
 def main() -> None:
     validate_config()
-    logger.info("[BOT] 🚀 IHSG Radar Bot & AI Screener v3.0 starting...")
-    logger.info(f"[BOT] Radar Kompas100: {len(config.WATCHLIST)} saham")
+    logger.info("[BOT] 🚀 Forex Radar Bot & AI Screener v1.0 starting...")
+    logger.info(f"[BOT] Memantau {len(config.FOREX_WATCHLIST)} instrumen")
 
     application = (
         ApplicationBuilder()
@@ -1105,8 +1080,8 @@ def main() -> None:
     application.add_handler(CommandHandler("autoscalping", cmd_autoscalping))
     application.add_handler(CommandHandler("autoscalpingforce", cmd_autoscalping_force))
     application.add_handler(CommandHandler("screening", cmd_screening))
-    application.add_handler(CommandHandler("market", cmd_market))
-    application.add_handler(CommandHandler("rekomendasi", cmd_rekomendasi))
+    application.add_handler(CommandHandler("heatmap", cmd_heatmap))
+    application.add_handler(CommandHandler("signals", cmd_signals))
     application.add_handler(CommandHandler("danger", cmd_danger))
     application.add_handler(CallbackQueryHandler(handle_callback))
 

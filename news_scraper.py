@@ -1,16 +1,15 @@
 """
-news_scraper.py - Pengambil Berita Saham dari Berbagai Sumber
+news_scraper.py - Pengambil Berita Forex & Makro Global
 =============================================================
 Modul ini bertanggung jawab untuk:
-1. Mengambil berita terbaru dari RSS feed portal berita keuangan Indonesia.
-2. Memfilter berita yang relevan dengan kode saham tertentu.
-3. Mengembalikan daftar headline berita untuk dianalisa oleh AI.
+1. Mengambil berita terbaru dari RSS feed portal berita keuangan Global.
+2. Memfilter berita yang relevan dengan pasangan mata uang (Pair).
+3. Mengambil jadwal High-Impact Economic Calendar (jika memungkinkan dari RSS).
 
 Sumber berita:
-- CNBC Indonesia (market RSS)
-- Kontan.co.id (investasi RSS)
-- Yahoo Finance (headline RSS per ticker)
-- Bisnis.com (market RSS)
+- Yahoo Finance Global (RSS)
+- Investing.com (RSS)
+- ForexLive / DailyFX (jika tersedia)
 """
 
 import logging
@@ -104,38 +103,34 @@ async def fetch_yahoo_finance_news(session: aiohttp.ClientSession, ticker_jk: st
 
 
 # ----------------------------------------------------------------
-# FILTER BERITA BERDASARKAN RELEVANSI SAHAM
+# FILTER BERITA BERDASARKAN RELEVANSI PAIR FOREX
 # ----------------------------------------------------------------
-def filter_relevant_news(articles: list[dict], kode_saham: str) -> list[dict]:
+def filter_relevant_news(articles: list[dict], pair: str) -> list[dict]:
     """
-    Memfilter berita yang relevan dengan kode saham tertentu.
-    Mencari kode saham atau nama umum perusahaan dalam judul berita.
-    
-    Args:
-        articles: List semua berita yang sudah diambil.
-        kode_saham: Kode saham bersih (tanpa .JK), contoh: 'INET'.
-        
-    Returns:
-        List berita yang relevan (terfilter).
+    Memfilter berita yang relevan dengan pair Forex tertentu.
+    Mencari nama mata uang atau Bank Sentral dalam judul berita.
     """
-    kode_bersih = kode_saham.upper().replace(".JK", "")
+    pair_bersih = pair.upper().replace("=X", "").replace("=F", "")
     
-    # Keyword tambahan berdasarkan kode saham umum IHSG
+    # Pisahkan Base dan Quote (misal EURUSD -> EUR, USD)
+    base = pair_bersih[:3] if len(pair_bersih) >= 6 else pair_bersih
+    quote = pair_bersih[3:6] if len(pair_bersih) >= 6 else ""
+
+    # Mapping keywords Bank Sentral dan Geografis
     keyword_map = {
-        "BBCA": ["BCA", "Bank Central Asia", "BBCA"],
-        "TLKM": ["Telkom", "TLKM", "Telekomunikasi Indonesia"],
-        "SIDO": ["Sidomuncul", "SIDO", "sido muncul"],
-        "INET": ["Indointernet", "INET", "Indo Internet"],
-        "AMMN": ["Amman Mineral", "AMMN", "amman"],
-        "BREN": ["Barito Renewables", "BREN", "barito"],
-        "BBRI": ["BRI", "Bank Rakyat Indonesia", "BBRI"],
-        "BMRI": ["Mandiri", "Bank Mandiri", "BMRI"],
-        "ASII": ["Astra", "ASII", "astra international"],
-        "GOTO": ["GoTo", "Gojek", "Tokopedia", "GOTO"],
+        "USD": ["USD", "Dollar", "Fed", "Powell", "US", "America", "Inflation", "NFP"],
+        "EUR": ["EUR", "Euro", "ECB", "Lagarde", "Europe", "Germany"],
+        "GBP": ["GBP", "Pound", "BOE", "Bailey", "UK", "Britain"],
+        "JPY": ["JPY", "Yen", "BOJ", "Ueda", "Japan"],
+        "AUD": ["AUD", "Aussie", "RBA", "Bullock", "Australia"],
+        "CAD": ["CAD", "Loonie", "BOC", "Macklem", "Canada", "Oil"],
+        "CHF": ["CHF", "Franc", "SNB", "Jordan", "Swiss"],
+        "NZD": ["NZD", "Kiwi", "RBNZ", "Orr", "New Zealand"],
+        "GC": ["Gold", "XAU", "Precious Metal"],
+        "CL": ["Oil", "WTI", "Crude", "OPEC"]
     }
 
-    # Buat pola pencarian dari keyword map atau kode saham itu sendiri
-    keywords_to_search = keyword_map.get(kode_bersih, [kode_bersih])
+    keywords_to_search = keyword_map.get(base, [base]) + keyword_map.get(quote, [quote])
 
     relevant = []
     for article in articles:
@@ -147,31 +142,30 @@ def filter_relevant_news(articles: list[dict], kode_saham: str) -> list[dict]:
 
 
 # ----------------------------------------------------------------
-# FUNGSI UTAMA: CARI BERITA UNTUK SATU SAHAM (ASYNC)
+# FUNGSI UTAMA: CARI BERITA UNTUK SATU PAIR (ASYNC)
 # ----------------------------------------------------------------
-async def get_news_for_stock(kode_saham: str, max_articles: int = config.MAX_NEWS_ARTICLES) -> list[str]:
+async def get_news_for_forex(pair: str, max_articles: int = config.MAX_NEWS_ARTICLES) -> list[str]:
     """
-    Fungsi utama untuk mencari berita terbaru tentang sebuah saham secara konruen (async).
-    Waktu eksekusi normal memendek menjadi <3 detik.
+    Fungsi utama untuk mencari berita terbaru tentang sebuah instrumen Forex secara sinkron.
     """
-    kode_bersih = kode_saham.upper().replace(".JK", "")
-    ticker_jk = f"{kode_bersih}.JK"
+    kode_bersih = pair.upper().replace("=X", "").replace("=F", "")
+    ticker_yf = pair.upper()
     all_articles = []
 
-    logger.info(f"[SCRAPER] ⚡ Async search untuk: {kode_bersih}")
+    logger.info(f"[SCRAPER] ⚡ Async search untuk Forex: {kode_bersih}")
 
+    # RSS feed Berita Global Ekonomi
     rss_sources = [
-        ("CNBC", "https://www.cnbcindonesia.com/rss"),
-        ("Kontan Investasi", "https://www.kontan.co.id/rss/investasi.rss"),
-        ("Kontan Saham", "https://www.kontan.co.id/rss/saham.rss"),
-        ("Bisnis", "https://ekonomi.bisnis.com/feed"),
+        ("Investing Forex", "https://rss.investing.com/news/forex.rss"),
+        ("Investing Commodities", "https://rss.investing.com/news/commodities.rss"),
+        ("Investing Economy", "https://rss.investing.com/news/economic_indicators.rss")
     ]
 
     async with aiohttp.ClientSession() as session:
         # Siapkan task RSS
         tasks = [fetch_from_rss(session, url, timeout=8) for name, url in rss_sources]
-        # Siapkan task Yahoo
-        yahoo_task = fetch_yahoo_finance_news(session, ticker_jk, timeout=10)
+        # Siapkan task Yahoo Finance per ticker
+        yahoo_task = fetch_yahoo_finance_news(session, ticker_yf, timeout=10)
         
         # Eksekusi PARALEL bersamaan
         results = await asyncio.gather(*tasks, yahoo_task, return_exceptions=True)
@@ -193,10 +187,10 @@ async def get_news_for_stock(kode_saham: str, max_articles: int = config.MAX_NEW
         elif yres:
             all_articles.extend(yres)
 
-        # Jika masih kosong, tembak Google News (tunggu ini selesai)
+        # Fallback Google News (Global)
         if not all_articles:
-            logger.info(f"[SCRAPER] Fallback Google News untuk {kode_bersih}...")
-            gnews_url = f"https://news.google.com/rss/search?q=saham+{kode_bersih}+IHSG&hl=id&gl=ID&ceid=ID:id"
+            logger.info(f"[SCRAPER] Fallback Google News Global untuk {kode_bersih}...")
+            gnews_url = f"https://news.google.com/rss/search?q={kode_bersih}+forex+news&hl=en-US&gl=US&ceid=US:en"
             try:
                 g_art = await fetch_from_rss(session, gnews_url, timeout=10)
                 all_articles.extend(g_art[:max_articles])
@@ -223,14 +217,13 @@ async def get_news_for_stock(kode_saham: str, max_articles: int = config.MAX_NEW
 
 async def get_macro_news(max_articles: int = 5) -> list[str]:
     """
-    (v5.0/v6.0) Ambil berita makro ekonomi terkini secara konruen (async).
+    (v6.0) Ambil berita makro ekonomi global terkini.
     """
-    logger.info("[SCRAPER] ⚡ Mengambil berita Markro secara Async...")
+    logger.info("[SCRAPER] ⚡ Mengambil berita Makro Global secara Async...")
     
     macro_sources = [
-        "https://www.cnbcindonesia.com/market/rss",
-        "https://ekonomi.bisnis.com/feed",
-        "https://nasional.kontan.co.id/rss/makro.rss",
+        "https://rss.investing.com/news/economy.rss",
+        "https://rss.investing.com/news/forex.rss",
     ]
     
     all_articles = []
@@ -259,8 +252,8 @@ async def get_macro_news(max_articles: int = 5) -> list[str]:
 if __name__ == "__main__":
     # Test modul secara standalone
     logging.basicConfig(level=logging.INFO)
-    berita = asyncio.run(get_news_for_stock("INET"))
+    berita = asyncio.run(get_news_for_forex("EURUSD=X"))
     print(f"\n{'='*50}")
-    print(f"Berita untuk INET:")
+    print(f"Berita untuk EURUSD:")
     for i, b in enumerate(berita, 1):
         print(f"{i}. {b}")

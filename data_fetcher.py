@@ -25,15 +25,31 @@ logger = logging.getLogger(__name__)
 # ----------------------------------------------------------------
 # UTILITAS
 # ----------------------------------------------------------------
-def format_ticker(kode_saham: str) -> str:
-    kode_saham = kode_saham.strip().upper()
-    if not kode_saham.endswith(".JK"):
-        kode_saham = f"{kode_saham}.JK"
-    return kode_saham
+def format_ticker(kode: str) -> str:
+    kode = kode.strip().upper()
+    # Forex major/cross often ends with =X in Yahoo Finance
+    if any(x in kode for x in ["=X", "USD", "EUR", "JPY", "GBP", "AUD", "CAD", "CHF", "NZD"]):
+        if not kode.endswith("=X") and len(kode) == 6:
+            return f"{kode}=X"
+        return kode
+    # Commodities like GC=F (Gold), CL=F (Oil)
+    if "=F" in kode:
+        return kode
+    # Fallback to .JK for stocks if any remains (though this bot is for forex)
+    if not any(x in kode for x in ["=X", "=F", "^", ".", "="]):
+         return f"{kode}.JK"
+    return kode
 
 
 def get_clean_code(ticker: str) -> str:
-    return ticker.replace(".JK", "").upper()
+    return ticker.replace(".JK", "").replace("=X", "").upper()
+
+
+def get_pip_multiplier(ticker: str) -> float:
+    """Helper untuk PIP calculation (Forex 4/5 digit vs JPY 2/3 digit)."""
+    if "JPY" in ticker:
+        return 100.0  # 1 pip = 0.01
+    return 10000.0    # 1 pip = 0.0001
 
 
 # ----------------------------------------------------------------
@@ -168,7 +184,7 @@ def get_daily_trend(kode_saham: str) -> dict:
         uptrend = harga_terakhir > nilai_ema20d
         selisih_pct = ((harga_terakhir - nilai_ema20d) / nilai_ema20d) * 100
 
-        logger.info(f"[MTF] Daily trend: harga={harga_terakhir:,.0f} EMA20d={nilai_ema20d:,.0f} uptrend={uptrend}")
+        logger.info(f"[MTF] Daily trend: harga={harga_terakhir:.5f} EMA20d={nilai_ema20d:.5f} uptrend={uptrend}")
         return {
             "uptrend_daily": uptrend,
             "harga_vs_ema20d": round(selisih_pct, 2),
@@ -227,15 +243,15 @@ def detect_signal(df: pd.DataFrame) -> dict:
 
     return {
         "sinyal_valid": is_valid,
-        "harga_terakhir": round(close_now, 2),
+        "harga_terakhir": round(close_now, 5),
         "kondisi": {
             "crossover": {
                 "status": is_crossover,
                 "ema_bullish": ema_bullish,
-                "ema_fast_sebelum": round(float(row_prev[col_ef]), 2),
-                "ema_slow_sebelum": round(float(row_prev[col_es]), 2),
-                "ema_fast_sekarang": round(float(row_last[col_ef]), 2),
-                "ema_slow_sekarang": round(float(row_last[col_es]), 2),
+                "ema_fast_sebelum": round(float(row_prev[col_ef]), 5),
+                "ema_slow_sebelum": round(float(row_prev[col_es]), 5),
+                "ema_fast_sekarang": round(float(row_last[col_ef]), 5),
+                "ema_slow_sekarang": round(float(row_last[col_es]), 5),
             },
             "volume": {
                 "status": is_vol_surge,
@@ -264,27 +280,41 @@ def detect_signal(df: pd.DataFrame) -> dict:
 def calculate_risk_management(df: pd.DataFrame, harga: float) -> dict:
     """
     Hitung Stop Loss dinamis berdasarkan ATR dan Target Price.
-    Stop Loss = harga - (1.5 × ATR)
-    Target    = harga + (2.0 × ATR)  → Risk/Reward minimal 1:1.3
+    Stop Loss = harga - (ATR_MULTIPLIER × ATR)
+    Target    = harga + (ATR_MULTIPLIER × ATR × RISK_REWARD)
     """
     try:
-        atr = float(df["ATR_14"].iloc[-1])
-        stop_loss = harga - (1.5 * atr)
-        target = harga + (2.0 * atr)
-        risiko = harga - stop_loss
-        potensi = target - harga
-        rr = round(potensi / risiko, 2) if risiko > 0 else 0
+        col_atr = f"ATR_{config.ATR_PERIOD}"
+        atr = float(df[col_atr].iloc[-1]) if col_atr in df.columns else float(df.filter(like='ATR').iloc[-1])
+        
+        stop_loss = harga - (config.ATR_MULTIPLIER * atr)
+        target = harga + (config.ATR_MULTIPLIER * atr * config.RISK_REWARD_RATIO)
+        
+        # Hitung jarak dalam Pip
+        multiplier = get_pip_multiplier("EURUSD=X") # Default, multiplier handles generic pairs
+        # Try to guess multiplier from price if needed (e.g. 1xx.x is likely JPY)
+        if harga > 50: multiplier = 100.0
+        else: multiplier = 10000.0
+
+        risiko_pips = abs(harga - stop_loss) * multiplier
+        potensi_pips = abs(target - harga) * multiplier
+        
+        rr = round(potensi_pips / risiko_pips, 2) if risiko_pips > 0 else 0
+        
         return {
-            "atr": round(atr, 2),
-            "stop_loss": round(stop_loss, 2),
-            "target_price": round(target, 2),
-            "risiko_per_saham": round(risiko, 2),
-            "potensi_per_saham": round(potensi, 2),
+            "atr": round(atr, 6),
+            "stop_loss": round(stop_loss, 5),
+            "target_price": round(target, 5),
+            "stop_pips": round(risiko_pips, 1),
+            "target_pips": round(potensi_pips, 1),
             "risk_reward": rr,
         }
     except Exception as e:
         logger.warning(f"[RISK] Error kalkulasi risk management: {e}")
-        return {"atr": 0, "stop_loss": 0, "target_price": 0, "risiko_per_saham": 0, "potensi_per_saham": 0, "risk_reward": 0}
+        return {
+            "atr": 0, "stop_loss": harga, "target_price": harga,
+            "stop_pips": 0, "target_pips": 0, "risk_reward": 0
+        }
 
 
 # ----------------------------------------------------------------
@@ -350,11 +380,11 @@ def calculate_pivot_points(df: pd.DataFrame) -> dict:
         h, l, c = float(prev["high"]), float(prev["low"]), float(prev["close"])
         pp = (h + l + c) / 3
         return {
-            "PP": round(pp, 2),
-            "R1": round((2 * pp) - l, 2),
-            "R2": round(pp + (h - l), 2),
-            "S1": round((2 * pp) - h, 2),
-            "S2": round(pp - (h - l), 2),
+            "PP": round(pp, 5),
+            "R1": round((2 * pp) - l, 5),
+            "R2": round(pp + (h - l), 5),
+            "S1": round((2 * pp) - h, 5),
+            "S2": round(pp - (h - l), 5),
         }
     except Exception as e:
         logger.warning(f"[PIVOT] Error: {e}")
@@ -665,22 +695,22 @@ def get_autoscalping_candidates(kode_list: list[str], force: bool = False) -> li
     """
     logger.info(f"[AUTOSCALP] Memulai filter kuantitatif scalping dari {len(kode_list)} saham... (Force: {force})")
     
-    # -- V6.0 IHSG MACRO WEATHER CHECK --
-    is_ihsg_dumping = False
+    # -- V1.0 FOREX MACRO WEATHER CHECK (DXY Correlation) --
+    is_dxy_rallying = False
     try:
-        ihsg_df = yf.Ticker("^JKSE").history(period="2d", interval="1d")
-        if len(ihsg_df) >= 2:
-            prev_close = ihsg_df['Close'].iloc[-2]
-            curr_close = ihsg_df['Close'].iloc[-1]
-            ihsg_pct = ((curr_close - prev_close) / prev_close) * 100
+        dxy_df = yf.Ticker("DX-Y.NYB").history(period="2d", interval="1h")
+        if len(dxy_df) >= 2:
+            prev_close = dxy_df['Close'].iloc[-2]
+            curr_close = dxy_df['Close'].iloc[-1]
+            dxy_pct = ((curr_close - prev_close) / prev_close) * 100
             
-            if ihsg_pct <= -0.6:
-                is_ihsg_dumping = True
-                logger.warning(f"[AUTOSCALP] ⚠️ CUACA BURUK: IHSG Drop {ihsg_pct:.2f}%. Bot akan sangat defensif.")
+            if dxy_pct >= 0.2:
+                is_dxy_rallying = True
+                logger.warning(f"[AUTOSCALP] ⚠️ DXY RALLY (+{dxy_pct:.2f}%): USD menguat tajam, hati-hati pair XXXUSD.")
             else:
-                logger.info(f"[AUTOSCALP] 🌤 Cuaca IHSG Aman ({ihsg_pct:.2f}%).")
+                logger.info(f"[AUTOSCALP] 🌤 Cuaca DXY Normal ({dxy_pct:.2f}%).")
     except Exception as e:
-        logger.error(f"[AUTOSCALP] Gagal cek IHSG: {e}")
+        logger.error(f"[AUTOSCALP] Gagal cek DXY: {e}")
 
     data_map = bulk_fetch_ohlcv(kode_list)
     candidates = []
@@ -696,19 +726,17 @@ def get_autoscalping_candidates(kode_list: list[str], force: bool = False) -> li
         
         # Filter awal
         if not force:
-            if score < 60 or vol_surge < 2.0 or rsi >= 75:
+            if score < 50 or vol_surge < 1.0 or rsi >= 75:
                 continue
         else:
             # Force mode: filter lebih longgar
-            if score < 40 or vol_surge < 1.0 or rsi >= 85:
+            if score < 35 or rsi >= 85:
                 continue
             
         full_data = full_screening(kode)
         if not full_data:
             continue
             
-        # Di mode force, uptrend daily tidak mutlak harus True jika score lain mendukung, 
-        # tapi kita jadikan penambah nilai saja.
         daily_trend_ok = full_data.get("daily_trend", {}).get("uptrend_daily", False)
         if not force and not daily_trend_ok:
             continue
@@ -716,8 +744,9 @@ def get_autoscalping_candidates(kode_list: list[str], force: bool = False) -> li
         is_squeeze_break = full_data["kondisi"]["bollinger"]["breakout"]
         scalp_power = score + (vol_surge * 10) + (20 if is_squeeze_break else 0)
         
-        if is_ihsg_dumping:
-            scalp_power -= 25
+        # Jika DXY rally, pair XXXUSD (EURUSD, GBPUSD) biasanya drop
+        if is_dxy_rallying and "USD" in full_data["kode"] and not full_data["kode"].startswith("USD"):
+            scalp_power -= 20
             
         full_data["scalp_power"] = scalp_power
         candidates.append(full_data)

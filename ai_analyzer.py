@@ -55,11 +55,11 @@ from db_manager import get_cached_sentiment, save_cached_sentiment
 
 
 # ----------------------------------------------------------------
-# PROMPT SISTEM (v2.0 - termasuk rekomendasi trading)
+# PROMPT SISTEM (v3.0 - Ahli Forex & Makro Global)
 # ----------------------------------------------------------------
-SYSTEM_PROMPT = """Kamu adalah analis saham senior yang ahli dalam pasar saham Indonesia (IHSG) dan technical analysis.
+SYSTEM_PROMPT = """Kamu adalah analis Forex & Makro Ekonomi Global senior yang ahli dalam pergerakan pasangan mata uang (Major & Cross) serta korelasi instrumen seperti Gold (XAUUSD) dan DXY (Dollar Index).
 
-Tugasmu: Analisa gabungan berita + data teknikal untuk menghasilkan rekomendasi trading yang akurat.
+Tugasmu: Analisa gabungan berita + data teknikal untuk menghasilkan rekomendasi trading forex yang akurat.
 
 ATURAN KETAT:
 - Jawab HANYA dengan format JSON yang valid.
@@ -86,25 +86,25 @@ PANDUAN REKOMENDASI:
 - SELL: Berita negatif atau teknikal melemah
 - STRONG SELL: Berita sangat buruk atau teknikal breakdown"""
 
-AUTOSCALP_SYSTEM_PROMPT = """Kamu adalah Komandan Trading Kuantitatif spesialis Scalping IHSG.
-Tugasmu: Diberikan data berita Makro Ekonomi Global/Nasional dan 1-3 kandidat saham dengan lonjakan volume fantastis. Pilih SATU saham paling sempurna untuk discalping hari ini.
+AUTOSCALP_SYSTEM_PROMPT = """Kamu adalah Prop Trader Forex Kuantitatif spesialis Scalping/Intraday.
+Tugasmu: Diberikan data berita Makro Ekonomi Global (terutama terkait USD/Fed/ECB dll) dan 1-3 kandidat pair forex dengan momentum volatilitas sempurna. Pilih SATU pair paling berpotensi untuk discalping hari ini.
 
 ATURAN KETAT:
 - WAJIB output dalam JSON.
-- Evaluasi pengaruh berita Makro terhadap pasar hari ini.
-- Jika ada berita fundamental/kasus korupsi buruk pada kandidat, coret kandidat tersebut!
+- Evaluasi pengaruh berita Makro terhadap pasar forex hari ini (Risk On / Risk Off).
+- Jika ada rilis data "Red Folder" (NFP, CPI, Fed Rate) yang bertentangan tajam dengan setup, coret kandidat tersebut!
 
 FORMAT JSON WAJIB:
 {
-  "market_view": "Analisa singkat cuaca market hari ini berdasarkan berita makro (1 kalimat)",
-  "pemenang_kode": "BBCA",
-  "pemenang_nama": "PT Bank Central Asia",
-  "alasan_menang": "Alasan solid mengapa saham ini menang vs kandidat lain (2 kalimat, sebutkan efek volume/news)",
+  "market_view": "Analisa singkat cuaca market forex (DXY/Risk Sentiment) hari ini berdasarkan berita makro (1 kalimat)",
+  "pemenang_kode": "EURUSD=X",
+  "pemenang_nama": "Euro / US Dollar",
+  "alasan_menang": "Alasan solid mengapa pair ini menang vs kandidat lain (2 kalimat, sebutkan efek volatilitas/news)",
   "trading_plan": {
-    "entry_area": "Area harga masuk yang aman (kisaran)",
-    "target_1": "Target take profit awal (+3% s.d +5%)",
-    "target_2": "Target take profit maksimal (+10%)",
-    "stop_loss": "Angka cut loss disiplin (-2% s.d -3%)"
+    "entry_area": "Area harga masuk yang aman (kisaran presisi)",
+    "target_1": "Target take profit awal (+10 hingga +20 Pips)",
+    "target_2": "Target take profit maksimal (+30 hingga +50 Pips)",
+    "stop_loss": "Angka cut loss ketat (-10 hingga -15 Pips)"
   },
   "pesan_psikologi": "Satu pesan disiplin singkat untuk trader"
 }"""
@@ -128,7 +128,7 @@ def _build_prompt(kode: str, headlines: list[str], tech_context: dict | None = N
         )
 
     return (
-        f"Analisa saham {kode} berdasarkan {len(headlines)} headline berita:{ctx}\n\n"
+        f"Analisa instrumen {kode} berdasarkan {len(headlines)} headline berita makro/fundamental:{ctx}\n\n"
         f"HEADLINE BERITA:\n{numbered}\n\n"
         f"Berikan analisa dan rekomendasi trading dalam format JSON."
     )
@@ -305,18 +305,18 @@ async def analyze_autoscalping(candidates: list[dict], macro_news: list[str]) ->
         score = c["technical_score"]
         bb = "BREAKOUT SQUEEZE" if c["kondisi"]["bollinger"]["breakout"] else "Normal"
         
-        # Ambil 3 headline berita khusus perusahaan ini
-        from news_scraper import get_news_for_stock
-        stock_news = await get_news_for_stock(kode, max_articles=3)
-        news_str = "\n  - ".join(stock_news) if stock_news else "Tidak ada berita korporasi spesifik terbaru."
+# Ambil 3 headline berita khusus pair ini
+        from news_scraper import get_news_for_forex
+        stock_news = await get_news_for_forex(kode, max_articles=3)
+        news_str = "\n  - ".join(stock_news) if stock_news else "Tidak ada berita fundamental spesifik instrumen ini."
         
-        cand_text += f"\nKANDIDAT: {kode} (Rp {harga:,.0f} | Naik: {pct:.1f}%)\n"
+        cand_text += f"\nKANDIDAT: {kode} (Harga: {harga:.5f} | Gerak: {pct:.2f}%)\n"
         cand_text += f"Teknikal: Score {score}/100, RSI {rsi:.1f}, Volume {vol:.1f}x rata-rata, BB {bb}\n"
-        cand_text += f"Berita Korporasi:\n  - {news_str}\n"
+        cand_text += f"Berita Instrumen/Fundamental:\n  - {news_str}\n"
 
     user_prompt = (
-        f"KONDISI MAKRO EKONOMI SAAT INI:\n{macro_text}\n\n"
-        f"DATA KANDIDAT SAHAM SCALPING:\n{cand_text}\n\n"
+        f"KONDISI MAKRO GLOBAL SAAT INI (Fokus sentimen USD/Risk):\n{macro_text}\n\n"
+        f"DATA KANDIDAT PAIR FOREX SCALPING:\n{cand_text}\n\n"
         f"Tugas: Tentukan 1 saham pemenang dan buatkan Trading Plan presisi. Output WAJIB JSON."
     )
 
@@ -447,7 +447,8 @@ def _validate(data: dict) -> dict:
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    hasil = analyze_sentiment("BBCA", ["BBCA Catat Laba Bersih Rp 50 Triliun", "BCA Ekspansi Digital Banking"],
-                              tech_context={"technical_score": 72, "rsi": 45.0, "uptrend_daily": True})
+    from news_scraper import get_news_for_forex
+    hasil = asyncio.run(analyze_sentiment("EURUSD=X", ["ECB Keeps Rates Unchanged", "Euro Drops as Dollar Rallies"],
+                               tech_context={"technical_score": 72, "rsi": 45.0, "uptrend_daily": True}))
     print(f"Sentimen: {hasil['sentimen']} | Reko: {hasil['rekomendasi']} | {hasil['skor_keyakinan']}/10")
     print(f"Alasan: {hasil['alasan_singkat']}")

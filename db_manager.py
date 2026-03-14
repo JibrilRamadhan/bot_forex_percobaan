@@ -21,7 +21,6 @@ async def init_db():
     try:
         async with aiosqlite.connect(DB_PATH) as db:
             # 1. Tabel Cache Sentimen AI
-            # kode_saham, hasil_json, timestamp_berlaku
             await db.execute('''
                 CREATE TABLE IF NOT EXISTS sentiment_cache (
                     kode TEXT PRIMARY KEY,
@@ -30,8 +29,22 @@ async def init_db():
                 )
             ''')
             
-            # 2. Tabel Histori Sinyal (Untuk tracking Win Rate di masa depan)
-            # Tipe: "SCALPING", "REKOMENDASI"
+            # 2. Tabel Kalender Ekonomi (v1.0 Forex)
+            await db.execute('''
+                CREATE TABLE IF NOT EXISTS economic_calendar (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_time DATETIME,
+                    currency TEXT,
+                    impact TEXT,
+                    event_name TEXT,
+                    actual TEXT,
+                    forecast TEXT,
+                    previous TEXT
+                )
+            ''')
+            
+            # 3. Tabel Histori Sinyal (Untuk tracking Win Rate di masa depan)
+            # Tipe: "SCALPING", "SIGNALS"
             await db.execute('''
                 CREATE TABLE IF NOT EXISTS signal_history (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -42,7 +55,7 @@ async def init_db():
                     target_1 REAL,
                     stop_loss REAL,
                     status TEXT DEFAULT 'OPEN',
-                    profit_loss_pct REAL NULL
+                    profit_loss REAL NULL
                 )
             ''')
             await db.commit()
@@ -107,6 +120,6 @@ async def log_signal(tipe_sinyal: str, kode: str, harga_masuk: float, target: fl
                 VALUES (?, ?, ?, ?, ?, ?)
             ''', (ts, tipe_sinyal, kode, harga_masuk, target, stop_loss))
             await db.commit()
-            logger.info(f"[DB] 📝 Signal jurnal dicatat: {kode} ({tipe_sinyal}) di Rp {harga_masuk:,.0f}")
+            logger.info(f"[DB] 📝 Signal jurnal dicatat: {kode} ({tipe_sinyal}) @ {harga_masuk}")
     except Exception as e:
         logger.error(f"[DB] Error logging signal {kode}: {e}")
