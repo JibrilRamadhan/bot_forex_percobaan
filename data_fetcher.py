@@ -432,7 +432,7 @@ if __name__ == "__main__":
 # ----------------------------------------------------------------
 # BULK DOWNLOAD (v3.0) - Tarik 100 Saham Sekaligus
 # ----------------------------------------------------------------
-def bulk_fetch_ohlcv(kode_list: list[str], interval: str = "15m", period: str = "2d") -> dict:
+def bulk_fetch_ohlcv(kode_list: list[str], interval: str = "15m", period: str = "2d", min_len: int = 2) -> dict:
     """
     Download data OHLCV untuk banyak saham SEKALIGUS dalam 1 request yfinance.
     Jauh lebih cepat daripada looping satu per satu.
@@ -470,7 +470,7 @@ def bulk_fetch_ohlcv(kode_list: list[str], interval: str = "15m", period: str = 
                     df.columns = df.columns.get_level_values(0)
                 df.columns = [c.lower() for c in df.columns]
                 df.dropna(subset=["close", "volume"], inplace=True)
-                if len(df) > 10:
+                if len(df) >= min_len:
                     result[kode] = df
             except Exception:
                 continue
@@ -531,7 +531,7 @@ def scan_kompas100_buy(kode_list: list[str]) -> list[dict]:
             AND volume surge
     """
     logger.info(f"[REKO] Mulai scan {len(kode_list)} saham untuk kandidat BUY...")
-    data_map = bulk_fetch_ohlcv(kode_list)
+    data_map = bulk_fetch_ohlcv(kode_list, min_len=10)
     candidates = []
 
     for kode, df in data_map.items():
@@ -559,7 +559,7 @@ def scan_kompas100_danger(kode_list: list[str]) -> list[dict]:
             OR (RSI overbought AND volume turun)
     """
     logger.info(f"[DANGER] Mulai scan {len(kode_list)} saham untuk deteksi bahaya...")
-    data_map = bulk_fetch_ohlcv(kode_list)
+    data_map = bulk_fetch_ohlcv(kode_list, min_len=10)
     dangerous = []
 
     for kode, df in data_map.items():
@@ -593,7 +593,7 @@ def get_market_leaders(kode_list: list[str]) -> dict:
     Hanya butuh data OHLCV dasar, sangat cepat menggunakan bulk_fetch_ohlcv.
     """
     logger.info(f"[MARKET] Mengambil market data dari {len(kode_list)} saham...")
-    data_map = bulk_fetch_ohlcv(kode_list, interval="1d", period="2d") # Pakai daily untuk gain hari ini
+    data_map = bulk_fetch_ohlcv(kode_list, interval="1d", period="2d", min_len=2) # Pakai daily untuk gain hari ini
     
     all_data = []
     
