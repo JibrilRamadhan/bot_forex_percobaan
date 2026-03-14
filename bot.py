@@ -448,7 +448,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 /watchlist — Daftar pantauan radar
 /help — Panduan lengkap
 """.strip()
-    await update.message.reply_text(pesan, parse_mode=ParseMode.HTML,
+    await update.effective_message.reply_text(pesan, parse_mode=ParseMode.HTML,
                                     reply_markup=InlineKeyboardMarkup(keyboard))
 
 
@@ -473,7 +473,7 @@ Amankan profit Anda!
 ━━━━━━━━━━━━━━━━━━━━━━━━
 {EMOJI['warning']} <i>Bot ini adalah alat bantu. BUKAN rekomendasi resmi. DYOR! by J</i>
 """.strip()
-    await update.message.reply_text(pesan, parse_mode=ParseMode.HTML)
+    await update.effective_message.reply_text(pesan, parse_mode=ParseMode.HTML)
 
 
 async def cmd_watchlist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -497,7 +497,7 @@ async def cmd_watchlist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 💡 <i>Gunakan /signals untuk top BUY hari ini</i>
 """.strip()
-    await update.message.reply_text(pesan, parse_mode=ParseMode.HTML)
+    await update.effective_message.reply_text(pesan, parse_mode=ParseMode.HTML)
 
 
 async def cmd_screening(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -513,7 +513,7 @@ async def cmd_screening(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             ]
             tombol_rows.append(row)
 
-        await update.message.reply_text(
+        await update.effective_message.reply_text(
             f"{EMOJI['radar']} <b>Pilih pair untuk dianalisa:</b>\n"
             f"<i>Atau ketik: /screening KODE (contoh: /screening EURUSD=X)</i>",
             parse_mode=ParseMode.HTML,
@@ -525,9 +525,9 @@ async def cmd_screening(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     # Add back =X for fetcher
     if len(kode_input) == 6:
         kode_input = f"{kode_input}=X"
-    await update.message.reply_chat_action("typing")
+    await update.effective_message.reply_chat_action("typing")
 
-    loading_msg = await update.message.reply_text(
+    loading_msg = await update.effective_message.reply_text(
         f"{EMOJI['clock']} <b>[1/4]</b> Mengambil data harga & kalkulasi indikator...",
         parse_mode=ParseMode.HTML)
 
@@ -586,13 +586,13 @@ async def cmd_screening(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                     f"🏁 <b>{reko_label}</b>"
                 )
                 try:
-                    await update.message.reply_photo(
+                    await update.effective_message.reply_photo(
                         photo=chart_buf,
                         caption=caption_pendek,
                         parse_mode=ParseMode.HTML)
                     await loading_msg.delete()
                     # Kirim analisa lengkap sebagai pesan teks terpisah
-                    await update.message.reply_text(pesan, parse_mode=ParseMode.HTML)
+                    await update.effective_message.reply_text(pesan, parse_mode=ParseMode.HTML)
                 except Exception as photo_err:
                     logger.warning(f"[BOT] Gagal kirim chart, fallback ke teks: {photo_err}")
                     await loading_msg.edit_text(pesan, parse_mode=ParseMode.HTML)
@@ -620,7 +620,7 @@ async def cmd_screening(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 # ----------------------------------------------------------------
 async def cmd_calendar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Menampilkan jadwal berita ekonomi penting hari ini."""
-    msg = await update.message.reply_text(f"{EMOJI['clock']} Mengambil data kalender ekonomi...")
+    msg = await update.effective_message.reply_text(f"{EMOJI['clock']} Mengambil data kalender ekonomi...")
     
     try:
         calendar = await get_economic_calendar()
@@ -663,8 +663,8 @@ async def cmd_calendar(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ----------------------------------------------------------------
 async def cmd_signals(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Scan Forex dan tampilkan top kandidat BUY/SELL hari ini."""
-    await update.message.reply_chat_action("typing")
-    msg = await update.message.reply_text(
+    await update.effective_message.reply_chat_action("typing")
+    msg = await update.effective_message.reply_text(
         f"{EMOJI['radar']} Scanning <b>{len(config.FOREX_WATCHLIST)} instrumen</b> untuk kandidat BUY..."
         f"\n<i>Proses sekitar 30 detik...</i>",
         parse_mode=ParseMode.HTML)
@@ -727,8 +727,8 @@ async def cmd_signals(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 # ----------------------------------------------------------------
 async def cmd_danger(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Scan Forex untuk mendeteksi Drop / Volatilitas bahaya."""
-    await update.message.reply_chat_action("typing")
-    msg = await update.message.reply_text(
+    await update.effective_message.reply_chat_action("typing")
+    msg = await update.effective_message.reply_text(
         f"{EMOJI['warning']} Scanning <b>{len(config.FOREX_WATCHLIST)} instrumen</b> untuk deteksi bahaya berita Red Folder..."
         f"\n<i>Proses sekitar 30 detik...</i>",
         parse_mode=ParseMode.HTML)
@@ -783,8 +783,8 @@ async def cmd_danger(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 # ----------------------------------------------------------------
 async def cmd_heatmap(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Tampilkan Ringkasan Volatilitas Mata Uang / Pasangan Mata uang."""
-    await update.message.reply_chat_action("typing")
-    msg = await update.message.reply_text(
+    await update.effective_message.reply_chat_action("typing")
+    msg = await update.effective_message.reply_text(
         f"{EMOJI['radar']} Mengumpulkan data Heatmap Market dari <b>{len(config.FOREX_WATCHLIST)} instrumen</b>..."
         f"\n<i>Proses sekitar 5-10 detik...</i>",
         parse_mode=ParseMode.HTML)
@@ -869,12 +869,12 @@ async def cmd_heatmap(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 # /AUTOSCALPING (v6.0) - AI Trading Plan Forex
 # ----------------------------------------------------------------
 async def _run_autoscalping(update: Update, context: ContextTypes.DEFAULT_TYPE, force: bool = False) -> None:
-    await update.message.reply_chat_action("typing")
+    await update.effective_message.reply_chat_action("typing")
     msg_text = f"{EMOJI['radar']} <b>Fase 1/3:</b> Filter Kuantitatif Ketat dari {len(config.FOREX_WATCHLIST)} instrumen..."
     if force:
         msg_text = f"{EMOJI['radar']} <b>Fase 1/3:</b> Filter Kuantitatif (Mode FORCE) dari {len(config.FOREX_WATCHLIST)} instrumen..."
         
-    msg = await update.message.reply_text(msg_text, parse_mode=ParseMode.HTML)
+    msg = await update.effective_message.reply_text(msg_text, parse_mode=ParseMode.HTML)
 
     try:
         # FASE 1: Filter Kuantitatif
@@ -1004,13 +1004,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await query.answer()
 
     if query.data == "watchlist":
-        await cmd_watchlist(update._replace(message=query.message), context)
+        await cmd_watchlist(update, context)
     elif query.data == "help":
-        await cmd_help(update._replace(message=query.message), context)
+        await cmd_help(update, context)
     elif query.data.startswith("screen_"):
         kode = query.data.replace("screen_", "")
         context.args = [kode]
-        await cmd_screening(update._replace(message=query.message), context)
+        await cmd_screening(update, context)
 
 
 # ----------------------------------------------------------------
@@ -1215,7 +1215,7 @@ async def cmd_winrate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         txt += f"💡 <i>Pasar sedang dinamis. Review strategi di Sesi London/NY.</i>"
     
     txt += f"\n💡 <i>DYOR! by J</i>"
-    await update.message.reply_text(txt, parse_mode=ParseMode.HTML)
+    await update.effective_message.reply_text(txt, parse_mode=ParseMode.HTML)
 
 
 
