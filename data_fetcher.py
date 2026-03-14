@@ -553,14 +553,14 @@ def quick_scan(kode_saham: str, df: pd.DataFrame) -> dict | None:
         return None
 
 
-def scan_kompas100_buy(kode_list: list[str]) -> list[dict]:
+def scan_forex_buy(kode_list: list[str]) -> list[dict]:
     """
-    Scan semua saham di kode_list untuk mencari kandidat BUY.
+    Scan semua instrumen di kode_list untuk mencari kandidat BUY.
     Filter: technical_score >= config.TECHNICAL_SCORE_BUY
             AND perubahan_pct dalam range VOLATILITY_MIN - VOLATILITY_MAX
             AND volume surge
     """
-    logger.info(f"[REKO] Mulai scan {len(kode_list)} saham untuk kandidat BUY...")
+    logger.info(f"[REKO] Mulai scan {len(kode_list)} pair untuk kandidat BUY...")
     data_map = bulk_fetch_ohlcv(kode_list, min_len=10)
     candidates = []
 
@@ -582,13 +582,13 @@ def scan_kompas100_buy(kode_list: list[str]) -> list[dict]:
     return candidates[:10]  # Top 10
 
 
-def scan_kompas100_danger(kode_list: list[str]) -> list[dict]:
+def scan_forex_danger(kode_list: list[str]) -> list[dict]:
     """
-    Scan semua saham di kode_list untuk mendeteksi saham BERBAHAYA.
-    Filter: perubahan_pct <= DANGER_DROP_PCT (turun >= 2.5%)
+    Scan semua instrumen di kode_list untuk mendeteksi pergerakan BERBAHAYA.
+    Filter: perubahan_pct <= DANGER_DROP_PCT
             OR (RSI overbought AND volume turun)
     """
-    logger.info(f"[DANGER] Mulai scan {len(kode_list)} saham untuk deteksi bahaya...")
+    logger.info(f"[DANGER] Mulai scan {len(kode_list)} pair untuk deteksi bahaya...")
     data_map = bulk_fetch_ohlcv(kode_list, min_len=10)
     dangerous = []
 
@@ -600,8 +600,8 @@ def scan_kompas100_danger(kode_list: list[str]) -> list[dict]:
         rsi = result["kondisi"]["rsi"]["nilai"]
         score = result["technical_score"]
 
-        # Saham dianggap berbahaya jika:
-        # 1. Turun >= 2.5% dalam sehari, ATAU
+        # Instrumen dianggap berbahaya jika:
+        # 1. Turun drastis dalam sehari, ATAU
         # 2. RSI overbought (> 75) dengan score lemah (potensi reversal turun)
         is_dropping = pct <= config.DANGER_DROP_PCT
         is_overbought_weak = rsi > 75 and score < 40
@@ -622,7 +622,7 @@ def get_market_leaders(kode_list: list[str]) -> dict:
     (v4.0) Ambil data market leaders: Top Gainer, Top Volume, Top Value, dan Live Rebound.
     Hanya butuh data OHLCV dasar, sangat cepat menggunakan bulk_fetch_ohlcv.
     """
-    logger.info(f"[MARKET] Mengambil market data dari {len(kode_list)} saham...")
+    logger.info(f"[MARKET] Mengambil data market dari {len(kode_list)} pair...")
     data_map = bulk_fetch_ohlcv(kode_list, interval="1d", period="2d", min_len=2) # Pakai daily untuk gain hari ini
     
     all_data = []
@@ -693,7 +693,7 @@ def get_autoscalping_candidates(kode_list: list[str], force: bool = False) -> li
     (v5.0 & v6.0) Cari 1-3 kandidat TERBAIK secara kuantitatif untuk Auto Scalping.
     Jika force=True, filter lebih longgar untuk memastikan ada kandidat.
     """
-    logger.info(f"[AUTOSCALP] Memulai filter kuantitatif scalping dari {len(kode_list)} saham... (Force: {force})")
+    logger.info(f"[AUTOSCALP] Memulai filter kuantitatif scalping dari {len(kode_list)} pair... (Force: {force})")
     
     # -- V1.0 FOREX MACRO WEATHER CHECK (DXY Correlation) --
     is_dxy_rallying = False
