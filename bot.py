@@ -418,35 +418,48 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     nama = user.first_name if user else "Trader"
     keyboard = [
-        [InlineKeyboardButton("📡 Watchlist", callback_data="watchlist"),
-         InlineKeyboardButton("❓ Bantuan", callback_data="help")],
-        [InlineKeyboardButton("📊 Contoh Screening BBCA", callback_data="screen_BBCA")],
+        [
+            InlineKeyboardButton("📡 Watchlist", callback_data="watchlist"),
+            InlineKeyboardButton("❓ Panduan", callback_data="help")
+        ],
+        [
+            InlineKeyboardButton("📊 EURUSD", callback_data="screen_EURUSD=X"),
+            InlineKeyboardButton("📊 GBPUSD", callback_data="screen_GBPUSD=X"),
+        ],
+        [
+            InlineKeyboardButton("📊 GBPJPY", callback_data="screen_GBPJPY=X"),
+            InlineKeyboardButton("🥇 Gold (XAU)", callback_data="screen_GC=F"),
+        ],
     ]
     pesan = f"""
-{EMOJI['rocket']} <b>Selamat datang, {html.escape(nama)} di Dunia Forex!</b>
+{EMOJI['rocket']} <b>Halo, {html.escape(nama)}! Selamat datang di Forex AI v2.0 🔥</b>
 
 {EMOJI['radar']} <b>Forex Daily Scalper & AI Screener v2.0</b>
+     <i>by J — Dirancang untuk Trader Profesional</i>
 
 ━━━━━━━━━━━━━━━━━━━━━━━━
-{EMOJI['star']} <b>FITUR ANDALAN</b>
+{EMOJI['star']} <b>FITUR UNGGULAN</b>
 ━━━━━━━━━━━━━━━━━━━━━━━━
-📊 Auto Chart Candlestick
-🛡️ PIPs Auto Calculation untuk Stop Loss
-⚡ Volatility & Macro Trend Checks
-🌐 Berita Fundamental Real-Time
-🏁 Rekomendasi AI Profesional
+📊 Auto Chart Candlestick + EMA + RSI
+🛡️ Risk Management Otomatis (Lot Size & Pips)
+⚡ Volatility & Multi-Timeframe Checks
+📅 Kalender Ekonomi Real-Time (Red Folder)
+🤖 AI Trading Plan (Llama-3 + Gemini)
+🏆 Currency Strength Meter (CSM)
 
 ━━━━━━━━━━━━━━━━━━━━━━━━
 📋 <b>PERINTAH UTAMA</b>
 ━━━━━━━━━━━━━━━━━━━━━━━━
-/autoscalping — AI Trading Plan (Setup Terbaik)
-/autoscalpingforce — Paksa AI buat setup (High Risk)
-/screening [PAIR] — Analisa pair (contoh: EURUSD=X)
-/heatmap — Live pergerakan Major/Crosses
-/signals — Top BUY/SELL candidate
-/danger — Pair dengan Volatilitas Berbahaya
-/watchlist — Daftar pantauan radar
-/help — Panduan lengkap
+/autoscalping — 🤖 AI Trading Plan Setup Terbaik
+/autoscalpingforce — ⚡ Paksa AI (High Risk)
+/screening [PAIR] — 📊 Analisa teknikal + chart
+/heatmap — 🌡️ Live CSM & kekuatan mata uang
+/signals — 🎯 Top kandidat BUY hari ini
+/calendar — 📅 Kalender Ekonomi & Red Folder
+/winrate — 🏆 Win Rate & statistik bot
+/danger — ⚠️ Pair berisiko tinggi
+/watchlist — 📡 Daftar instrumen pantauan
+/help — ❓ Panduan lengkap
 """.strip()
     await update.effective_message.reply_text(pesan, parse_mode=ParseMode.HTML,
                                     reply_markup=InlineKeyboardMarkup(keyboard))
@@ -454,24 +467,29 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     pesan = f"""
-{EMOJI['info']} <b>PANDUAN PENGGUNAAN FOREX BOT</b>
+{EMOJI['info']} <b>PANDUAN PENGGUNAAN FOREX BOT v2.0</b>
 ━━━━━━━━━━━━━━━━━━━━━━━━
 
 {EMOJI['chart_up']} <b>Screening & Rekomendasi:</b>
 <code>/autoscalping</code> — AI pilihkan 1 setup scalping terbaik!
 <code>/autoscalpingforce</code> — Paksa AI jika Anda agresif.
-<code>/screening PAIR</code> — Contoh: EURUSD=X atau GBPAUD=X
-<code>/heatmap</code> — Pantau mata uang mana yang paling aktif
-<code>/signals</code> — Sinyal BUY terbaik hr ini
-<code>/danger</code> — Hindari pergerakan ekstrem/news spike
+<code>/screening PAIR</code> — Contoh: <code>EURUSD=X</code>, <code>GBPJPY=X</code>, <code>GC=F</code>
+<code>/heatmap</code> — Currency Strength Meter Real-Time
+<code>/signals</code> — Top sinyal BUY hari ini
+<code>/calendar</code> — Kalender ekonomi & jadwal Red Folder
+<code>/danger</code> — Hindari pair dengan spike berita
 
 ━━━━━━━━━━━━━━━━━━━━━━━━
-🛡️ <b>Manejemen Risiko (Pips):</b>
-Stop loss dihitung berdasarkan ATR dan Quote Currency.
-Amankan profit Anda!
+📈 <b>Tracking Performa:</b>
+<code>/winrate</code> — Statistik akurasi bot (WIN/LOSS)
 
 ━━━━━━━━━━━━━━━━━━━━━━━━
-{EMOJI['warning']} <i>Bot ini adalah alat bantu. BUKAN rekomendasi resmi. DYOR! by J</i>
+🛡️ <b>Manajemen Risiko (Otomatis):</b>
+Stop Loss dihitung berdasarkan ATR × 1.5
+Lot Size dihitung berdasarkan risiko 1% per trade
+
+━━━━━━━━━━━━━━━━━━━━━━━━
+{EMOJI['warning']} <i>Bot ini adalah alat bantu analisa. BUKAN saran investasi resmi. Selalu DYOR! by J</i>
 """.strip()
     await update.effective_message.reply_text(pesan, parse_mode=ParseMode.HTML)
 
@@ -521,10 +539,26 @@ async def cmd_screening(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         )
         return
 
-    kode_input = context.args[0].strip().upper().replace(".JK", "").replace("=X", "")
-    # Add back =X for fetcher
-    if len(kode_input) == 6:
-        kode_input = f"{kode_input}=X"
+    # Normalisasi Ticker — Mendukung Forex (EURUSD=X), Commodity (GC=F), dll.
+    raw = context.args[0].strip().upper()
+    # Jika sudah ada suffix yfinance, pakai langsung
+    if "=X" in raw or "=F" in raw or raw.endswith("=F"):
+        kode_input = raw
+    elif len(raw) == 6 and raw.isalpha():
+        # Pair forex 6 huruf → tambahkan =X
+        kode_input = f"{raw}=X"
+    elif raw in ("XAUUSD", "GOLD", "GC"):
+        kode_input = "GC=F"
+    elif raw in ("XAGUSD", "SILVER"):
+        kode_input = "SI=F"
+    elif raw in ("OIL", "CRUDEOIL", "CL"):
+        kode_input = "CL=F"
+    elif raw in ("BZ", "BRENT"):
+        kode_input = "BZ=F"
+    else:
+        # Fallback: pakai raw input langsung
+        kode_input = raw
+
     await update.effective_message.reply_chat_action("typing")
 
     loading_msg = await update.effective_message.reply_text(
@@ -856,7 +890,7 @@ async def cmd_heatmap(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             txt += "<i>Belum ada data...</i>\n"
 
         txt += f"\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        txt += f"💡 <i>Gunakan /screening [KODE] untuk cek teknikal. by JR</i>"
+        txt += f"💡 <i>Gunakan /screening [KODE] untuk cek teknikal detail. by J</i>"
 
         await msg.edit_text(txt, parse_mode=ParseMode.HTML)
 
@@ -1094,9 +1128,9 @@ async def radar_scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             # Log to Database
             try:
                 harga = data.get("harga_terakhir", 0.0)
-                rr = data.get("kondisi", {}).get("risk_reward", {})
-                target = rr.get("target_price_1", 0.0)
-                sl = rr.get("stop_loss_price", 0.0)
+                risk_m = data.get("risk_management", {})
+                target = risk_m.get("target_price", 0.0)
+                sl = risk_m.get("stop_loss", 0.0)
                 await db.log_signal("RADAR_SCAN", kode, harga, target, sl)
             except Exception as db_err:
                 logger.error(f"[DB] Error logging radar signal: {db_err}")
@@ -1164,6 +1198,10 @@ async def trade_tracker_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         
     logger.info(f"[TRACKER] Mengecek {len(open_signals)} sinyal OPEN...")
     
+    # Bungkus yf.download ke fungsi sync agar bisa di-run in executor
+    def fetch_1m_data(ticker):
+        return yf.download(ticker, period="1d", interval="1m", progress=False)
+    
     for s in open_signals:
         try:
             sid = s["id"]
@@ -1173,22 +1211,25 @@ async def trade_tracker_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             entry = s["harga_masuk"]
             
             ticker = format_ticker(kode)
-            # Ambil data terbaru 1 menit
-            data = yf.download(ticker, period="1d", interval="1m", progress=False)
+            
+            # Gunakan Run in Executor agar tidak memblokir Bot
+            data = await asyncio.get_event_loop().run_in_executor(None, fetch_1m_data, ticker)
             if data.empty: continue
             
-            # Close terakhir adalah harga saat ini
             if isinstance(data.columns, pd.MultiIndex):
                 data.columns = data.columns.get_level_values(0)
             
-            curr_price = float(data["Close"].iloc[-1])
+            # Cari harga Tertinggi (High) dan Terendah (Low) hari ini
+            highest_price = float(data["High"].max())
+            lowest_price = float(data["Low"].min())
             
-            # Resolusi Sinyal (P/L Calculation)
-            if curr_price >= target:
+            # Resolusi Sinyal: Cek apakah High menyentuh Target ATAU Low menyentuh SL
+            # Asumsi ini adalah posisi BUY (Long)
+            if highest_price >= target:
                 pl = ((target - entry) / entry) * 100
                 await db.update_signal_status(sid, "WIN", pl)
                 logger.info(f"[TRACKER] 🏆 {kode} hit TARGET! status set to WIN.")
-            elif curr_price <= sl:
+            elif lowest_price <= sl:
                 pl = ((sl - entry) / entry) * 100
                 await db.update_signal_status(sid, "LOSS", pl)
                 logger.info(f"[TRACKER] 🛑 {kode} hit SL! status set to LOSS.")

@@ -16,6 +16,15 @@ TELEGRAM_TOKEN: str = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID: str = os.getenv("TELEGRAM_CHAT_ID", "")
 
 # -------------------------------------------------------
+# MONEY & RISK MANAGEMENT
+# -------------------------------------------------------
+DEFAULT_EQUITY: float = 1000.0        # Modal trading dalam USD (contoh $1,000)
+RISK_PER_TRADE_PCT: float = 1.0       # Batas risiko kerugian maksimal per trade (1%)
+ATR_PERIOD: int = 14
+ATR_MULTIPLIER: float = 1.5           # Pengali ATR untuk Stop Loss
+RISK_REWARD_RATIO: float = 1.5        # RR 1:1.5
+
+# -------------------------------------------------------
 # KONFIGURASI AI (GEMINI & GROQ)
 # -------------------------------------------------------
 GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
@@ -111,6 +120,7 @@ RADAR_INTERVAL_MINUTES: int = 15
 # -------------------------------------------------------
 MAX_NEWS_ARTICLES: int = 5
 SENTIMENT_CACHE_TTL_MINUTES: int = 30
+
 
 # -------------------------------------------------------
 # VALIDASI

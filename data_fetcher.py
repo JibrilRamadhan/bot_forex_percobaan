@@ -824,8 +824,8 @@ def get_autoscalping_candidates(kode_list: list[str], force: bool = False, calen
         
         # Jika Sesi Tokyo (Pagi), perketat filter volume krn liquidity rendah/sideways
         if is_tokyo and not force:
-            if vol_surge < 3.0: # Perlu lonjakan volume sangat tinggi (3x) di Tokyo
-                logger.info(f"[AUTOSCALP] 😴 {kode} diabaikan: Volume Tokyo rendah (×{vol_ratio:.1f} < 3x)")
+            if vol_surge < 3.0: 
+                logger.info(f"[AUTOSCALP] 😴 {kode} diabaikan: Volume Tokyo rendah (×{vol_surge:.1f} < 3x)")
                 continue
 
         # Filter awal
