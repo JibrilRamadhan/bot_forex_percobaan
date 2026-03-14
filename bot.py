@@ -43,7 +43,7 @@ from ai_analyzer import (
     analyze_sentiment, is_signal_approved, get_final_recommendation,
     analyze_autoscalping
 )
-from db_manager import init_db, log_signal
+import db_manager as db
 
 # ----------------------------------------------------------------
 # LOGGING
@@ -157,18 +157,22 @@ def generate_chart(df: pd.DataFrame, kode: str, screening_data: dict) -> io.Byte
             h_lines.append(screening_data["harga_terakhir"])
             h_colors.append("#33B5E5") # Cyan for Entry
             
-        fig, axes = mpf.plot(
-            df_chart,
-            type="candle",
-            style=s,
-            title=title,
-            volume=True,
-            addplot=addplots if addplots else None,
-            hlines=dict(hlines=h_lines, colors=h_colors, linestyle="-.", linewidths=1.0) if h_lines else None,
-            panel_ratios=(4, 1, 2) if col_rsi in df_chart.columns else (4, 1),
-            figsize=(12, 8),
-            returnfig=True,
-        )
+        # v7.5 Fix: mplfinance sometimes rejects 'None' for addplot/hlines explicitly passed
+        mpf_kwargs = {
+            "type": "candle",
+            "style": s,
+            "title": title,
+            "volume": True,
+            "panel_ratios": (4, 1, 2) if col_rsi in df_chart.columns else (4, 1),
+            "figsize": (12, 8),
+            "returnfig": True
+        }
+        if addplots:
+            mpf_kwargs["addplot"] = addplots
+        if h_lines:
+            mpf_kwargs["hlines"] = dict(hlines=h_lines, colors=h_colors, linestyle="-.", linewidths=1.0)
+            
+        fig, axes = mpf.plot(df_chart, **mpf_kwargs)
         fig.savefig(buf, format="png", dpi=120, bbox_inches="tight",
                     facecolor="#0D0D0D")
 
