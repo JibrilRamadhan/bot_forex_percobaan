@@ -71,7 +71,7 @@ EMOJI = {
     "bell": "🔔", "news": "📰", "robot": "🤖", "clock": "🕐",
     "money": "💰", "radar": "📡", "star": "⭐", "info": "ℹ️",
     "bullish": "🟢", "bearish": "🔴", "neutral": "🟡",
-    "shield": "🛡️", "lightning": "⚡", "chart": "📊",
+    "shield": "🛡️", "lightning": "⚡", "chart": "📊", "search": "🔍",
 }
 
 SENTIMENT_EMOJI = {"Bullish": "🟢", "Bearish": "🔴", "Neutral": "🟡"}
