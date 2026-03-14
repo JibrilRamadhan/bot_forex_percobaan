@@ -18,6 +18,7 @@ import numpy as np
 from typing import Optional
 
 import config
+from news_scraper import is_kill_switch_active
 
 logger = logging.getLogger(__name__)
 
@@ -553,12 +554,13 @@ def quick_scan(kode_saham: str, df: pd.DataFrame) -> dict | None:
         return None
 
 
-def scan_forex_buy(kode_list: list[str]) -> list[dict]:
+def scan_forex_buy(kode_list: list[str], calendar: list = None) -> list[dict]:
     """
     Scan semua instrumen di kode_list untuk mencari kandidat BUY.
     Filter: technical_score >= config.TECHNICAL_SCORE_BUY
             AND perubahan_pct dalam range VOLATILITY_MIN - VOLATILITY_MAX
             AND volume surge
+            AND No Red Folder News (Kill-Switch)
     """
     logger.info(f"[REKO] Mulai scan {len(kode_list)} pair untuk kandidat BUY...")
     data_map = bulk_fetch_ohlcv(kode_list, min_len=10)
@@ -574,8 +576,27 @@ def scan_forex_buy(kode_list: list[str]) -> list[dict]:
 
         # Filter volatilitas sweet spot
         in_sweet_spot = config.VOLATILITY_MIN_PCT <= pct <= config.VOLATILITY_MAX_PCT
-        if score >= config.TECHNICAL_SCORE_BUY and in_sweet_spot and vol_surge:
+        
+        # Check Kill-Switch (Red Folder Filter)
+        killed = False
+        kill_reason = ""
+        if calendar:
+            ticker = format_ticker(kode)
+            # Check both base and quote currency
+            base = ticker[:3]
+            quote = ticker[3:6]
+            
+            kill_base, msg_base = is_kill_switch_active(calendar, base)
+            kill_quote, msg_quote = is_kill_switch_active(calendar, quote)
+            
+            if kill_base or kill_quote:
+                killed = True
+                kill_reason = msg_base or msg_quote
+
+        if score >= config.TECHNICAL_SCORE_BUY and in_sweet_spot and vol_surge and not killed:
             candidates.append(result)
+        elif killed:
+            logger.warning(f"[REKO] 🛡 {kode} diabaikan: {kill_reason} (Kill-Switch)")
 
     candidates.sort(key=lambda x: x["technical_score"], reverse=True)
     logger.info(f"[REKO] ✅ {len(candidates)} kandidat BUY ditemukan")
@@ -688,7 +709,7 @@ def get_market_leaders(kode_list: list[str]) -> dict:
     }
 
 
-def get_autoscalping_candidates(kode_list: list[str], force: bool = False) -> list[dict]:
+def get_autoscalping_candidates(kode_list: list[str], force: bool = False, calendar: list = None) -> list[dict]:
     """
     (v5.0 & v6.0) Cari 1-3 kandidat TERBAIK secara kuantitatif untuk Auto Scalping.
     Jika force=True, filter lebih longgar untuk memastikan ada kandidat.
@@ -748,6 +769,15 @@ def get_autoscalping_candidates(kode_list: list[str], force: bool = False) -> li
         if is_dxy_rallying and "USD" in full_data["kode"] and not full_data["kode"].startswith("USD"):
             scalp_power -= 20
             
+        # -- RED FOLDER KILL SWITCH (v7.0) --
+        if calendar:
+            base, quote = full_data["kode"][:3], full_data["kode"][3:6]
+            k_base, _ = is_kill_switch_active(calendar, base)
+            k_quote, _ = is_kill_switch_active(calendar, quote)
+            if k_base or k_quote:
+                logger.warning(f"[AUTOSCALP] 🛡 {full_data['kode']} dieliminasi karena Red Folder News.")
+                continue
+
         full_data["scalp_power"] = scalp_power
         candidates.append(full_data)
 

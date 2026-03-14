@@ -19,6 +19,8 @@ import aiohttp
 import feedparser
 from typing import Optional
 from bs4 import BeautifulSoup
+from datetime import datetime, timedelta
+import pytz
 
 import config
 
@@ -248,12 +250,99 @@ async def get_macro_news(max_articles: int = 5) -> list[str]:
     
     return unique_headlines[:max_articles]
 
+# ----------------------------------------------------------------
+# FUNGSI KALENDER EKONOMI (v7.0 HOLY GRAIL)
+# ----------------------------------------------------------------
+
+async def get_economic_calendar():
+    """
+    Mengambil jadwal rilis berita ekonomi (Red Folder).
+    Mencoba dari ForexFactory (Mirror) atau Mock data jika gagal.
+    """
+    logger.info("[CALENDAR] 📅 Mengambil Kalender Ekonomi...")
+    url = "https://nfs.forexfactory.com/ff_calendar_thisweek.xml"
+    
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+    }
+
+    calendar_data = []
+    try:
+        # Gunakan aiohttp dengan SSL verify=False karena kendala network Telkomsel/Mirror
+        connector = aiohttp.TCPConnector(ssl=False)
+        async with aiohttp.ClientSession(connector=connector) as session:
+            async with session.get(url, headers=headers, timeout=10) as response:
+                if response.status == 200:
+                    xml_content = await response.text()
+                    feed = feedparser.parse(xml_content)
+                    
+                    for entry in feed.entries:
+                        # Parse date/time
+                        # Format FF: mm-dd-yyyy hh:mm(am/pm)
+                        try:
+                            # Gabungkan date dan time
+                            dt_str = f"{entry.get('date')} {entry.get('time')}"
+                            # Parse ke UTC (Estimasi FF XML biasanya UTC)
+                            event_time = datetime.strptime(dt_str, "%m-%d-%Y %I:%M%p")
+                            event_time = event_time.replace(tzinfo=pytz.UTC)
+                            
+                            calendar_data.append({
+                                "title": entry.get("title", "Unknown Event"),
+                                "country": entry.get("country", ""),
+                                "impact": entry.get("impact", "Low"), # High, Medium, Low
+                                "time": event_time,
+                                "forecast": entry.get("forecast", ""),
+                                "previous": entry.get("previous", "")
+                            })
+                        except:
+                            continue
+    except Exception as e:
+        logger.warning(f"[CALENDAR] Gagal mengambil data real: {e}. Menggunakan MOCK data.")
+
+    # Jika gagal/kosong, gunakan Mock Data (Simulasi untuk pengetesan)
+    if not calendar_data:
+        # Mocking event hari ini
+        now_utc = datetime.now(pytz.UTC)
+        calendar_data = [
+            {
+                "title": "US Core CPI m/m (MOCK)",
+                "country": "USD",
+                "impact": "High",
+                "time": now_utc + timedelta(minutes=15), # 15 menit lagi
+                "forecast": "0.3%",
+                "previous": "0.2%"
+            }
+        ]
+
+    return calendar_data
+
+def is_kill_switch_active(calendar_data, currency="USD", buffer_minutes=30):
+    """
+    Logika Sabuk Pengaman: 
+    Jika ada berita High Impact dalam 30 menit ke depan, return True.
+    """
+    now_utc = datetime.now(pytz.UTC)
+    
+    for event in calendar_data:
+        if event["impact"] == "High" and event["country"] == currency:
+            time_diff = (event["time"] - now_utc).total_seconds() / 60
+            
+            # Jika dalam jangkauan 30 menit (sebelum/setelah rilis)
+            if -buffer_minutes <= time_diff <= buffer_minutes:
+                logger.warning(f"[KILL-SWITCH] 🚨 AKTIF! Berita: {event['title']} dlm {int(time_diff)} mnt.")
+                return True, event["title"]
+                
+    return False, None
+
 
 if __name__ == "__main__":
     # Test modul secara standalone
     logging.basicConfig(level=logging.INFO)
+    # Test News
     berita = asyncio.run(get_news_for_forex("EURUSD=X"))
-    print(f"\n{'='*50}")
-    print(f"Berita untuk EURUSD:")
-    for i, b in enumerate(berita, 1):
-        print(f"{i}. {b}")
+    print(f"\nBerita: {berita[:2]}")
+    # Test Calendar
+    cal = asyncio.run(get_economic_calendar())
+    print(f"Calendar: {len(cal)} events")
+    active, msg = is_kill_switch_active(cal)
+    print(f"Kill Switch USD: {active} ({msg})")

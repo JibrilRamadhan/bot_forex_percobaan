@@ -38,7 +38,7 @@ from data_fetcher import (
     scan_forex_buy, scan_forex_danger,
     get_market_leaders, get_autoscalping_candidates
 )
-from news_scraper import get_news_for_forex, get_macro_news
+from news_scraper import get_news_for_forex, get_macro_news, get_economic_calendar, is_kill_switch_active
 from ai_analyzer import (
     analyze_sentiment, is_signal_approved, get_final_recommendation,
     analyze_autoscalping
@@ -594,6 +594,49 @@ async def cmd_screening(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 # ----------------------------------------------------------------
+# COMMAND: /calendar (v7.0 HOLY GRAIL)
+# ----------------------------------------------------------------
+async def cmd_calendar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Menampilkan jadwal berita ekonomi penting hari ini."""
+    msg = await update.message.reply_text(f"{EMOJI['clock']} Mengambil data kalender ekonomi...")
+    
+    try:
+        calendar = await get_economic_calendar()
+        if not calendar:
+            await msg.edit_text("Tidak ada data kalender ekonomi tersedia.")
+            return
+
+        txt = (
+            f"📅 <b>KALENDER EKONOMI HARI INI</b>\n"
+            f"<i>Fokus pada High Impact (Red Folder)</i>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        )
+        
+        # Sort based on time
+        calendar.sort(key=lambda x: x["time"])
+        
+        for event in calendar:
+            time_str = event["time"].astimezone(WIB).strftime("%H:%M")
+            impact_emoji = "🔴" if event["impact"] == "High" else "🟡" if event["impact"] == "Medium" else "⚪"
+            
+            txt += (
+                f"{time_str} | {impact_emoji} <b>{event['country']}</b>\n"
+                f"📌 {event['title']}\n"
+            )
+            if event["forecast"] or event["previous"]:
+                txt += f"📊 <i>F: {event['forecast']} | P: {event['previous']}</i>\n"
+            txt += "\n"
+
+        txt += f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        txt += f"<i>{EMOJI['info']} Hindari trading 30 menit sebelum/sesudah berita High Impact (🔴) untuk menghindari slippage.</i>"
+        
+        await msg.edit_text(txt, parse_mode=ParseMode.HTML)
+    except Exception as e:
+        logger.error(f"[CALENDAR] Error: {e}")
+        await msg.edit_text("Gagal mengambil data kalender.")
+
+
+# ----------------------------------------------------------------
 # /SIGNALS
 # ----------------------------------------------------------------
 async def cmd_signals(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -605,8 +648,11 @@ async def cmd_signals(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         parse_mode=ParseMode.HTML)
 
     try:
+        # v7.0 Fetch Calendar first for Kill-Switch
+        calendar = await get_economic_calendar()
+        
         candidates = await asyncio.get_event_loop().run_in_executor(
-            None, scan_forex_buy, config.FOREX_WATCHLIST)
+            None, scan_forex_buy, config.FOREX_WATCHLIST, calendar)
 
         if not candidates:
             await msg.edit_text(
@@ -799,8 +845,11 @@ async def _run_autoscalping(update: Update, context: ContextTypes.DEFAULT_TYPE, 
 
     try:
         # FASE 1: Filter Kuantitatif
+        # v7.0 Ambil Kalender Ekonomi
+        calendar = await get_economic_calendar()
+        
         candidates = await asyncio.get_event_loop().run_in_executor(
-            None, get_autoscalping_candidates, config.FOREX_WATCHLIST, force)
+            None, get_autoscalping_candidates, config.FOREX_WATCHLIST, force, calendar)
             
         if not candidates:
             await msg.edit_text(
@@ -1054,6 +1103,7 @@ async def post_init(application: Application) -> None:
         BotCommand("heatmap", "Data volatilitas Major dan Crosses"),
         BotCommand("signals", "Top pair kandidat BUY/SELL"),
         BotCommand("danger", "Peringatan Drop/Red Folder"),
+        BotCommand("calendar", "Jadwal berita ekonomi (v7.0)"),
         BotCommand("watchlist", "Pantauan instrumen"),
         BotCommand("help", "Panduan penggunaan"),
     ]
@@ -1083,6 +1133,7 @@ def main() -> None:
     application.add_handler(CommandHandler("heatmap", cmd_heatmap))
     application.add_handler(CommandHandler("signals", cmd_signals))
     application.add_handler(CommandHandler("danger", cmd_danger))
+    application.add_handler(CommandHandler("calendar", cmd_calendar))
     application.add_handler(CallbackQueryHandler(handle_callback))
 
     job_queue = application.job_queue
