@@ -49,7 +49,7 @@ KOMPAS100: list[str] = [
     # --- CONSUMER & RETAIL ---
     "UNVR", "ICBP", "INDF", "MYOR", "GGRM", "HMSP", "SIDO", "KLBF",
     "KAEF", "HEAL", "MIKA", "SILO", "ROTI", "ACES", "MAPI", "AMRT",
-    "RALS", "MAP",
+    "RALS", "MAPA",
     # --- PROPERTI & KONSTRUKSI ---
     "BSDE", "CTRA", "LPKR", "PWON", "SMGR", "INTP", "SMCB",
     "ADHI", "PTPP", "WSKT", "WTON", "DMAS",

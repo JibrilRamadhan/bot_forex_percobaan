@@ -658,17 +658,12 @@ def get_market_leaders(kode_list: list[str]) -> dict:
     }
 
 
-def get_autoscalping_candidates(kode_list: list[str]) -> list[dict]:
+def get_autoscalping_candidates(kode_list: list[str], force: bool = False) -> list[dict]:
     """
     (v5.0 & v6.0) Cari 1-3 kandidat TERBAIK secara kuantitatif untuk Auto Scalping.
-    Kriteria ekstrim:
-    - Volume Surge sangat tinggi (>2.5x rata-rata)
-    - Harga dalam tren naik (Uptrend Daily)
-    - RSI tidak boleh Extreme Overbought (RSI < 75) agar masih ada upside.
-    - Squeeze Breakout mendapat bobot ekstra.
-    - (v6.0) IHSG Trend Penality: Jika market sedang crash, nyali bot dikurangi.
+    Jika force=True, filter lebih longgar untuk memastikan ada kandidat.
     """
-    logger.info(f"[AUTOSCALP] Memulai filter kuantitatif scalping dari {len(kode_list)} saham...")
+    logger.info(f"[AUTOSCALP] Memulai filter kuantitatif scalping dari {len(kode_list)} saham... (Force: {force})")
     
     # -- V6.0 IHSG MACRO WEATHER CHECK --
     is_ihsg_dumping = False
@@ -679,7 +674,7 @@ def get_autoscalping_candidates(kode_list: list[str]) -> list[dict]:
             curr_close = ihsg_df['Close'].iloc[-1]
             ihsg_pct = ((curr_close - prev_close) / prev_close) * 100
             
-            if ihsg_pct <= -0.6:  # IHSG turun tajam > 0.6% sehari
+            if ihsg_pct <= -0.6:
                 is_ihsg_dumping = True
                 logger.warning(f"[AUTOSCALP] ⚠️ CUACA BURUK: IHSG Drop {ihsg_pct:.2f}%. Bot akan sangat defensif.")
             else:
@@ -691,8 +686,6 @@ def get_autoscalping_candidates(kode_list: list[str]) -> list[dict]:
     candidates = []
 
     for kode, df in data_map.items():
-        # Gunakan full_screening untuk ini karena butuh Daily Trend konfirmasi sejati
-        # Untuk optimasi, kita cek quick_scan dulu. Jika jelek, skip full_screening.
         quick = quick_scan(kode, df)
         if not quick:
             continue
@@ -701,37 +694,42 @@ def get_autoscalping_candidates(kode_list: list[str]) -> list[dict]:
         vol_surge = quick["kondisi"]["volume"]["rasio"]
         rsi = quick["kondisi"]["rsi"]["nilai"]
         
-        # Filter awal sangat ketat
-        if score < 60 or vol_surge < 2.0 or rsi >= 75:
-            continue
+        # Filter awal
+        if not force:
+            if score < 60 or vol_surge < 2.0 or rsi >= 75:
+                continue
+        else:
+            # Force mode: filter lebih longgar
+            if score < 40 or vol_surge < 1.0 or rsi >= 85:
+                continue
             
-        # Jika lolos filter dasar, lakukan full_screening untuk cek Daily Trend
         full_data = full_screening(kode)
         if not full_data:
             continue
             
+        # Di mode force, uptrend daily tidak mutlak harus True jika score lain mendukung, 
+        # tapi kita jadikan penambah nilai saja.
         daily_trend_ok = full_data.get("daily_trend", {}).get("uptrend_daily", False)
-        if not daily_trend_ok:
+        if not force and not daily_trend_ok:
             continue
             
-        # Hitung Scalp Power (metric gabungan Volume + Momentum Squeeze + IHSG Context)
         is_squeeze_break = full_data["kondisi"]["bollinger"]["breakout"]
         scalp_power = score + (vol_surge * 10) + (20 if is_squeeze_break else 0)
         
-        # Penalti Cuaca IHSG Jeles (v6.0)
         if is_ihsg_dumping:
-            scalp_power -= 25  # Kurangi nyali secara drastis
-        
+            scalp_power -= 25
+            
         full_data["scalp_power"] = scalp_power
         candidates.append(full_data)
 
-    # Sort dari scalp power tertinggi
     candidates.sort(key=lambda x: x.get("scalp_power", 0), reverse=True)
     
-    # Ambil maksimal 3 yang powernya masih kuat biarpun dipenalti
-    final_candidates = [c for c in candidates if c["scalp_power"] > 70][:3]
+    if force:
+        final_candidates = candidates[:3]
+    else:
+        final_candidates = [c for c in candidates if c["scalp_power"] > 70][:3]
     
-    logger.info(f"[AUTOSCALP] ✅ Filter matematis selesai. Ditemukan {len(final_candidates)} top class scalping.")
+    logger.info(f"[AUTOSCALP] ✅ Ditemukan {len(final_candidates)} top class scalping.")
     return final_candidates
 
 

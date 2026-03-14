@@ -403,10 +403,10 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     pesan = f"""
 {EMOJI['rocket']} <b>Selamat datang, {html.escape(nama)}!</b>
 
-{EMOJI['radar']} <b>IHSG Radar Bot & AI Screener v2.0</b>
+{EMOJI['radar']} <b>IHSG Radar Bot & AI Screener v3.0</b>
 
 ━━━━━━━━━━━━━━━━━━━━━━━━
-{EMOJI['star']} <b>FITUR BARU v2.0</b>
+{EMOJI['star']} <b>FITUR BARU v3.0</b>
 ━━━━━━━━━━━━━━━━━━━━━━━━
 📊 Auto Chart Candlestick (PNG ke Telegram)
 🛡️ ATR Stop Loss + Target Price otomatis
@@ -418,6 +418,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 📋 <b>PERINTAH UTAMA</b>
 ━━━━━━━━━━━━━━━━━━━━━━━━
 /autoscalping — AI Trading Plan (Terbaik)
+/autoscalpingforce — Paksa AI mencari saham terbaik (High Risk)
 /screening [KODE] — Analisa saham + Chart
 /market — Live Gainers, Volume, Value, Rebound
 /rekomendasi — Top BUY dari Kompas100
@@ -431,11 +432,12 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     pesan = f"""
-{EMOJI['info']} <b>PANDUAN PENGGUNAAN v2.0</b>
+{EMOJI['info']} <b>PANDUAN PENGGUNAAN v3.0</b>
 ━━━━━━━━━━━━━━━━━━━━━━━━
 
 {EMOJI['chart_up']} <b>Screening & Rekomendasi:</b>
 <code>/autoscalping</code> — AI pilihkan 1 saham scalping terbaik + Trading Plan murni! (v5.0)
+<code>/autoscalpingforce</code> — Paksa AI mencari saham terbaik saat kondisi tidak ada yang ideal.
 <code>/screening KODE</code> — Analisa AI & Chart
 <code>/market</code> — Top Gainers, Vol, Value & Rebound
 <code>/rekomendasi</code> — Sinyal BUY terbaik hr ini
@@ -809,23 +811,25 @@ async def cmd_market(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 # ----------------------------------------------------------------
 # /AUTOSCALPING (v5.0) - The Ultimate AI Trading Plan
 # ----------------------------------------------------------------
-async def cmd_autoscalping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Scan Kompas100 secara kuantitatif, lalu biarkan AI membuat Trading Plan untuk 1 saham terbaik."""
+async def _run_autoscalping(update: Update, context: ContextTypes.DEFAULT_TYPE, force: bool = False) -> None:
     await update.message.reply_chat_action("typing")
-    msg = await update.message.reply_text(
-        f"{EMOJI['radar']} <b>Fase 1/3:</b> Filter Kuantitatif Ketat dari {len(config.KOMPAS100)} saham...",
-        parse_mode=ParseMode.HTML)
+    msg_text = f"{EMOJI['radar']} <b>Fase 1/3:</b> Filter Kuantitatif Ketat dari {len(config.KOMPAS100)} saham..."
+    if force:
+        msg_text = f"{EMOJI['radar']} <b>Fase 1/3:</b> Filter Kuantitatif (Mode FORCE) dari {len(config.KOMPAS100)} saham..."
+        
+    msg = await update.message.reply_text(msg_text, parse_mode=ParseMode.HTML)
 
     try:
         # FASE 1: Filter Kuantitatif
         candidates = await asyncio.get_event_loop().run_in_executor(
-            None, get_autoscalping_candidates, config.KOMPAS100)
+            None, get_autoscalping_candidates, config.KOMPAS100, force)
             
         if not candidates:
             await msg.edit_text(
                 f"🤷‍♂️ <b>Tidak ada kandidat sempurna saat ini.</b>\n"
                 f"Pasar tidak sedang memberikan setup scalping yang aman (Volume kurang, atau RSI jelek). "
-                f"<i>Cash is King!</i>", 
+                f"<i>Cash is King!</i>\n\n"
+                f"💡 <i>Gunakan /autoscalpingforce jika Anda tetap ingin memaksa AI mencari saham dengan probabilitas paling tinggi saat ini (High Risk).</i>", 
                 parse_mode=ParseMode.HTML)
             return
 
@@ -843,8 +847,7 @@ async def cmd_autoscalping(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             parse_mode=ParseMode.HTML)
 
         # FASE 3: AI Inference
-        ai_plan = await asyncio.get_event_loop().run_in_executor(
-            None, analyze_autoscalping, candidates, macro_news)
+        ai_plan = await analyze_autoscalping(candidates, macro_news)
 
         if not ai_plan or not isinstance(ai_plan, dict):
             await msg.edit_text(f"{EMOJI['cross']} AI Gagal meramu Trading Plan. Coba lagi.", parse_mode=ParseMode.HTML)
@@ -869,8 +872,9 @@ async def cmd_autoscalping(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             kode_jk = kode
             kode = kode.replace(".JK", "")
 
+        force_badge = " (FORCE MODE ⚠️ HIGH RISK)" if force else ""
         teks = (
-            f"⚡ <b>AUTO SCALPING TRADING PLAN</b> ⚡\n"
+            f"⚡ <b>AUTO SCALPING TRADING PLAN{force_badge}</b> ⚡\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"🌐 <b>Market Hari Ini:</b> {market_view}\n\n"
             
@@ -906,7 +910,8 @@ async def cmd_autoscalping(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if kode in cand_dict:
             df = cand_dict[kode]["df"]
             score = cand_dict[kode]["technical_score"]
-            photo_io = generate_chart(kode_jk, df, score, "SCALPING PLAN")
+            photo_io = await asyncio.get_event_loop().run_in_executor(
+                None, generate_chart, df, kode_jk, cand_dict[kode])
             if photo_io:
                 await context.bot.send_photo(
                     chat_id=update.effective_chat.id,
@@ -917,6 +922,15 @@ async def cmd_autoscalping(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     except Exception as e:
         logger.error(f"[BOT] Error /autoscalping: {e}")
         await msg.edit_text(f"{EMOJI['cross']} Terjadi kesalahan internal.", parse_mode=ParseMode.HTML)
+
+
+async def cmd_autoscalping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Scan Kompas100 secara kuantitatif, lalu biarkan AI membuat Trading Plan."""
+    await _run_autoscalping(update, context, force=False)
+
+async def cmd_autoscalping_force(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Scan Kompas100 dan paksa AI membuat Trading Plan meskipun tidak ideal."""
+    await _run_autoscalping(update, context, force=True)
 
 
 
@@ -1060,6 +1074,7 @@ async def post_init(application: Application) -> None:
     commands = [
         BotCommand("start", "Menu utama"),
         BotCommand("autoscalping", "AI Trading Plan Otomatis (v5.0)"),
+        BotCommand("autoscalpingforce", "Paksa AI mencari saham terbaik (High Risk)"),
         BotCommand("screening", "Analisa + Chart saham (contoh: /screening INET)"),
         BotCommand("market", "Data Top Gainer, Vol, Value & Rebound"),
         BotCommand("rekomendasi", "Top saham kandidat BUY hari ini dari Kompas100"),
@@ -1088,6 +1103,7 @@ def main() -> None:
     application.add_handler(CommandHandler("help", cmd_help))
     application.add_handler(CommandHandler("watchlist", cmd_watchlist))
     application.add_handler(CommandHandler("autoscalping", cmd_autoscalping))
+    application.add_handler(CommandHandler("autoscalpingforce", cmd_autoscalping_force))
     application.add_handler(CommandHandler("screening", cmd_screening))
     application.add_handler(CommandHandler("market", cmd_market))
     application.add_handler(CommandHandler("rekomendasi", cmd_rekomendasi))
