@@ -1,5 +1,5 @@
 """
-bot.py - Forex Trading Bot & AI Screener v1.0
+bot.py - Forex Trading Bot & AI Screener v2.0
 ==========================================
 Fitur:
 - Auto Chart Generation untuk Forex
@@ -333,7 +333,7 @@ def build_screening_message(screening_data: dict, sentiment_data: dict, headline
 ━━━━━━━━━━━━━━━━━━━━━━━━
 
 {EMOJI['clock']} {waktu_wib}
-{EMOJI['info']} <i>⚠️ Bukan rekomendasi resmi. Selalu DYOR! by JR</i>
+{EMOJI['info']} <i>⚠️ Bukan rekomendasi resmi. Selalu DYOR! by J</i>
 """.strip()
     return msg
 
@@ -406,7 +406,7 @@ def build_signal_alert_message(screening_data: dict, sentiment_data: dict) -> st
 
 🏁 <b>REKOMENDASI: {reko_label}</b>
 
-{EMOJI['clock']} {waktu_wib} | {EMOJI['info']} <i>DYOR! by JR</i>
+{EMOJI['clock']} {waktu_wib} | {EMOJI['info']} <i>DYOR! by J</i>
 """.strip()
     return msg
 
@@ -425,7 +425,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     pesan = f"""
 {EMOJI['rocket']} <b>Selamat datang, {html.escape(nama)} di Dunia Forex!</b>
 
-{EMOJI['radar']} <b>Forex Daily Scalper & AI Screener</b>
+{EMOJI['radar']} <b>Forex Daily Scalper & AI Screener v2.0</b>
 
 ━━━━━━━━━━━━━━━━━━━━━━━━
 {EMOJI['star']} <b>FITUR ANDALAN</b>
@@ -471,7 +471,7 @@ Stop loss dihitung berdasarkan ATR dan Quote Currency.
 Amankan profit Anda!
 
 ━━━━━━━━━━━━━━━━━━━━━━━━
-{EMOJI['warning']} <i>Bot ini adalah alat bantu. BUKAN rekomendasi resmi. DYOR! by JR</i>
+{EMOJI['warning']} <i>Bot ini adalah alat bantu. BUKAN rekomendasi resmi. DYOR! by J</i>
 """.strip()
     await update.message.reply_text(pesan, parse_mode=ParseMode.HTML)
 
@@ -954,7 +954,7 @@ async def _run_autoscalping(update: Update, context: ContextTypes.DEFAULT_TYPE, 
             
             f"📦 <b>RECOMMENDED LOT: {plan.get('lot_size', '0.01' if not candidates else candidates[0]['risk_management']['recommended_lot'])}</b> (Risk 1%)\n"
             f"⚠️ <b>Pesan AI:</b> <i>{psikologi}</i>\n"
-            f"💡 <i>DYOR! by JR</i>\n"
+            f"💡 <i>DYOR! by J</i>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
         )
         await msg.edit_text(teks, parse_mode=ParseMode.HTML)
@@ -1214,13 +1214,14 @@ async def cmd_winrate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     else:
         txt += f"💡 <i>Pasar sedang dinamis. Review strategi di Sesi London/NY.</i>"
     
+    txt += f"\n💡 <i>DYOR! by J</i>"
     await update.message.reply_text(txt, parse_mode=ParseMode.HTML)
 
 
 
 def main() -> None:
     validate_config()
-    logger.info("[BOT] 🚀 Forex Radar Bot & AI Screener v1.0 starting...")
+    logger.info("[BOT] 🚀 Forex Radar Bot & AI Screener v2.0 starting...")
     logger.info(f"[BOT] Memantau {len(config.FOREX_WATCHLIST)} instrumen")
 
     application = (
