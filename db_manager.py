@@ -123,3 +123,56 @@ async def log_signal(tipe_sinyal: str, kode: str, harga_masuk: float, target: fl
             logger.info(f"[DB] 📝 Signal jurnal dicatat: {kode} ({tipe_sinyal}) @ {harga_masuk}")
     except Exception as e:
         logger.error(f"[DB] Error logging signal {kode}: {e}")
+
+
+async def get_open_signals():
+    """Mengambil semua sinyal yang masih berstatus OPEN"""
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute('SELECT * FROM signal_history WHERE status = "OPEN"') as cursor:
+                return await cursor.fetchall()
+    except Exception as e:
+        logger.error(f"[DB] Error get open signals: {e}")
+        return []
+
+
+async def update_signal_status(signal_id: int, status: str, pl: float = 0.0):
+    """Update status sinyal (WIN/LOSS) dan simpan P/L"""
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute('''
+                UPDATE signal_history 
+                SET status = ?, profit_loss = ? 
+                WHERE id = ?
+            ''', (status, pl, signal_id))
+            await db.commit()
+            logger.info(f"[DB] ✅ Signal #{signal_id} updated: {status} (PL: {pl})")
+    except Exception as e:
+        logger.error(f"[DB] Error update signal status: {e}")
+
+
+async def get_signal_stats():
+    """Mengambil statistik performa bot (Win Rate)"""
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute('SELECT COUNT(*) FROM signal_history WHERE status != "OPEN"') as cursor:
+                total = (await cursor.fetchone())[0]
+            
+            async with db.execute('SELECT COUNT(*) FROM signal_history WHERE status = "WIN"') as cursor:
+                wins = (await cursor.fetchone())[0]
+                
+            async with db.execute('SELECT COUNT(*) FROM signal_history WHERE status = "LOSS"') as cursor:
+                losses = (await cursor.fetchone())[0]
+                
+            win_rate = (wins / total * 100) if total > 0 else 0
+            
+            return {
+                "total": total,
+                "wins": wins,
+                "losses": losses,
+                "win_rate": round(win_rate, 2)
+            }
+    except Exception as e:
+        logger.error(f"[DB] Error get stats: {e}")
+        return {"total": 0, "wins": 0, "losses": 0, "win_rate": 0}

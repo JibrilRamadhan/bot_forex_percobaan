@@ -142,6 +142,21 @@ def generate_chart(df: pd.DataFrame, kode: str, screening_data: dict) -> io.Byte
         title = f"{kode} | {harga:.5f} | Score: {tech_score}/100 | {waktu}"
 
         buf = io.BytesIO()
+        
+        # v7.5 Horizontal Lines (SL/TP)
+        h_lines = []
+        h_colors = []
+        risk_m = screening_data.get("risk_management", {})
+        if risk_m.get("stop_loss"):
+            h_lines.append(risk_m["stop_loss"])
+            h_colors.append("#FF4444") # Red for SL
+        if risk_m.get("target_price"):
+            h_lines.append(risk_m["target_price"])
+            h_colors.append("#00C851") # Green for TP
+        if screening_data.get("harga_terakhir"):
+            h_lines.append(screening_data["harga_terakhir"])
+            h_colors.append("#33B5E5") # Cyan for Entry
+            
         fig, axes = mpf.plot(
             df_chart,
             type="candle",
@@ -149,6 +164,7 @@ def generate_chart(df: pd.DataFrame, kode: str, screening_data: dict) -> io.Byte
             title=title,
             volume=True,
             addplot=addplots if addplots else None,
+            hlines=dict(hlines=h_lines, colors=h_colors, linestyle="-.", linewidths=1.0) if h_lines else None,
             panel_ratios=(4, 1, 2) if col_rsi in df_chart.columns else (4, 1),
             figsize=(12, 8),
             returnfig=True,
@@ -881,13 +897,20 @@ async def _run_autoscalping(update: Update, context: ContextTypes.DEFAULT_TYPE, 
 
         # FASE 2: Macro News
         macro_news = await get_macro_news(3)
+        
+        # v7.5 Fetch CSM for AI Context
+        from data_fetcher import get_market_leaders
+        market_stats = await asyncio.get_event_loop().run_in_executor(
+            None, get_market_leaders, config.FOREX_WATCHLIST[:15])
+        csm_data = market_stats.get("csm")
 
         await msg.edit_text(
-            f"🧠 <b>Fase 3/3:</b> Llama-3 70B sedang meramu Trading Plan...", 
+            f"🧠 <b>Fase 3/3:</b> Llama-3 70B sedang meramu Trading Plan...\n"
+            f"<i>Basis: CSM + Macro News + Technical</i>", 
             parse_mode=ParseMode.HTML)
 
         # FASE 3: AI Inference
-        ai_plan = await analyze_autoscalping(candidates, macro_news)
+        ai_plan = await analyze_autoscalping(candidates, macro_news, csm_data)
 
         if not ai_plan or not isinstance(ai_plan, dict):
             await msg.edit_text(f"{EMOJI['cross']} AI Gagal meramu Trading Plan. Coba lagi.", parse_mode=ParseMode.HTML)
@@ -937,10 +960,10 @@ async def _run_autoscalping(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         try:
             if kode in cand_dict:
                 harga_skrg = cand_dict[kode].get("harga_terakhir", 0.0)
-                rr = cand_dict[kode].get("kondisi", {}).get("risk_reward", {})
-                target_q = rr.get("target_price_1", 0.0)
-                sl_q = rr.get("stop_loss_price", 0.0)
-                await log_signal("AUTOSCALPING", kode, harga_skrg, target_q, sl_q)
+                risk_m = cand_dict[kode].get("risk_management", {})
+                target_q = risk_m.get("target_price", 0.0)
+                sl_q = risk_m.get("stop_loss", 0.0)
+                await db.log_signal("AUTOSCALPING", kode, harga_skrg, target_q, sl_q)
         except Exception as db_err:
             logger.error(f"[DB] Error logging autoscalp signal: {db_err}")
         
@@ -1123,6 +1146,73 @@ async def post_init(application: Application) -> None:
     ]
     await application.bot.set_my_commands(commands)
 
+# ----------------------------------------------------------------
+# TRADE TRACKER JOB & WINRATE (v7.5)
+# ----------------------------------------------------------------
+async def trade_tracker_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Job background untuk mengecek resolusi sinyal (WIN/LOSS)"""
+    from data_fetcher import format_ticker
+    import yfinance as yf
+    
+    open_signals = await db.get_open_signals()
+    if not open_signals:
+        return
+        
+    logger.info(f"[TRACKER] Mengecek {len(open_signals)} sinyal OPEN...")
+    
+    for s in open_signals:
+        try:
+            sid = s["id"]
+            kode = s["kode"]
+            target = s["target_1"]
+            sl = s["stop_loss"]
+            entry = s["harga_masuk"]
+            
+            ticker = format_ticker(kode)
+            # Ambil data terbaru 1 menit
+            data = yf.download(ticker, period="1d", interval="1m", progress=False)
+            if data.empty: continue
+            
+            # Close terakhir adalah harga saat ini
+            if isinstance(data.columns, pd.MultiIndex):
+                data.columns = data.columns.get_level_values(0)
+            
+            curr_price = float(data["Close"].iloc[-1])
+            
+            # Resolusi Sinyal (P/L Calculation)
+            if curr_price >= target:
+                pl = ((target - entry) / entry) * 100
+                await db.update_signal_status(sid, "WIN", pl)
+                logger.info(f"[TRACKER] 🏆 {kode} hit TARGET! status set to WIN.")
+            elif curr_price <= sl:
+                pl = ((sl - entry) / entry) * 100
+                await db.update_signal_status(sid, "LOSS", pl)
+                logger.info(f"[TRACKER] 🛑 {kode} hit SL! status set to LOSS.")
+                
+        except Exception as e:
+            logger.error(f"[TRACKER] Error tracking {s['kode']}: {e}")
+
+async def cmd_winrate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Tampilkan statistik performa AI Bot"""
+    stats = await db.get_signal_stats()
+    
+    txt = f"{EMOJI['chart']} <b>STATISTIK PERFORMA BOT AI</b>\n"
+    txt += f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    txt += f"📊 Total Sinyal Resolved: <b>{stats['total']}</b>\n"
+    txt += f"✅ Take Profit (WIN): <b>{stats['wins']}</b>\n"
+    txt += f"❌ Stop Loss (LOSS): <b>{stats['losses']}</b>\n"
+    txt += f"🔥 <b>Win Rate: {stats['win_rate']}%</b>\n\n"
+    
+    if stats['win_rate'] > 60:
+        txt += f"💡 <i>Bot dalam performa tinggi! Tetap jaga manajemen risiko.</i>"
+    elif stats['total'] < 5:
+        txt += f"💡 <i>Data belum cukup untuk statistik akurat. Terus pantau!</i>"
+    else:
+        txt += f"💡 <i>Pasar sedang dinamis. Review strategi di Sesi London/NY.</i>"
+    
+    await update.message.reply_text(txt, parse_mode=ParseMode.HTML)
+
+
 
 def main() -> None:
     validate_config()
@@ -1148,17 +1238,26 @@ def main() -> None:
     application.add_handler(CommandHandler("signals", cmd_signals))
     application.add_handler(CommandHandler("danger", cmd_danger))
     application.add_handler(CommandHandler("calendar", cmd_calendar))
+    application.add_handler(CommandHandler("winrate", cmd_winrate))
     application.add_handler(CallbackQueryHandler(handle_callback))
 
     job_queue = application.job_queue
     if job_queue:
+        # Job 1: Radar Scan (Existing)
         job_queue.run_repeating(
             callback=radar_scan_job,
             interval=config.RADAR_INTERVAL_MINUTES * 60,
             first=15,
             name="radar_scan",
         )
-        logger.info(f"[BOT] ⏰ Radar setiap {config.RADAR_INTERVAL_MINUTES} menit.")
+        # Job 2: Trade Tracking (v7.5) - Cek setiap 15 menit
+        job_queue.run_repeating(
+            callback=trade_tracker_job,
+            interval=15 * 60,
+            first=30,
+            name="trade_tracking",
+        )
+        logger.info(f"[BOT] ⏰ Radar & Trade Tracker Aktif.")
     else:
         logger.warning("[BOT] ⚠️ JobQueue tidak tersedia!")
 

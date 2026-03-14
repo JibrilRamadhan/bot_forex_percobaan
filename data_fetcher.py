@@ -817,18 +817,21 @@ def get_autoscalping_candidates(kode_list: list[str], force: bool = False, calen
         vol_surge = quick["kondisi"]["volume"]["rasio"]
         rsi = quick["kondisi"]["rsi"]["nilai"]
         
-        # -- SESSION AWARE VOLUME FILTER (v7.0) --
+        # -- SESSION AWARE VOLUME FILTER (v7.5) --
         curr_hour = datetime.now(config.WIB).hour
         is_golden = config.SESSION_GOLDEN_START <= curr_hour < config.SESSION_GOLDEN_END
+        is_tokyo = config.SESSION_TOKYO_START <= curr_hour < config.SESSION_TOKYO_END
         
-        # Jika bukan jam sibuk (Sydney/Tokyo 00-07 WIB), perketat filter volume
-        if 0 <= curr_hour < 7 and not force:
-            if vol_surge < 1.5: # Perlu lonjakan volume lebih tinggi saat sepi
+        # Jika Sesi Tokyo (Pagi), perketat filter volume krn liquidity rendah/sideways
+        if is_tokyo and not force:
+            if vol_surge < 3.0: # Perlu lonjakan volume sangat tinggi (3x) di Tokyo
+                logger.info(f"[AUTOSCALP] 😴 {kode} diabaikan: Volume Tokyo rendah (×{vol_ratio:.1f} < 3x)")
                 continue
 
         # Filter awal
         if not force:
-            if score < 50 or vol_surge < 1.0 or rsi >= 75:
+            min_score = 65 if is_tokyo else 50 # Tokyo butuh konfirmasi extra
+            if score < min_score or vol_surge < 1.0 or rsi >= 75:
                 continue
         else:
             # Force mode: filter lebih longgar
@@ -846,10 +849,13 @@ def get_autoscalping_candidates(kode_list: list[str], force: bool = False, calen
         is_squeeze_break = full_data["kondisi"]["bollinger"]["breakout"]
         scalp_power = score + (vol_surge * 10) + (20 if is_squeeze_break else 0)
         
-        # -- SESSION OVERLAP BONUS (v7.0 HOLY GRAIL) --
+        # -- SESSION SCORING ADJUSTMENTS (v7.5) --
         if is_golden:
             scalp_power += 20
             logger.info(f"[AUTOSCALP] 🏆 {kode} mendapat Bonus Golden Hour (+20)")
+        elif is_tokyo:
+            scalp_power -= 15 # Penalti Tokyo (False Breakout risk)
+            logger.info(f"[AUTOSCALP] 🐌 {kode} terkena Penalti Sesi Tokyo (-15)")
             
         # Jika DXY rally, pair XXXUSD (EURUSD, GBPUSD) biasanya drop
         if is_dxy_rallying and "USD" in full_data["kode"] and not full_data["kode"].startswith("USD"):
@@ -867,14 +873,26 @@ def get_autoscalping_candidates(kode_list: list[str], force: bool = False, calen
         full_data["scalp_power"] = scalp_power
         candidates.append(full_data)
 
+    # v7.5 MAXIMUM EXPOSURE & CORRELATION MANAGER
+    # Mencegah duplikasi mata uang dasar (e.g. jgn EURUSD & EURJPY bersamaan)
     candidates.sort(key=lambda x: x.get("scalp_power", 0), reverse=True)
     
-    if force:
-        final_candidates = candidates[:3]
-    else:
-        final_candidates = [c for c in candidates if c["scalp_power"] > 70][:3]
+    final_candidates = []
+    used_bases = set()
     
-    logger.info(f"[AUTOSCALP] ✅ Ditemukan {len(final_candidates)} top class scalping.")
+    for c in candidates:
+        base = c["kode"][:3]
+        if base in used_bases and not force:
+            continue
+            
+        if force or c["scalp_power"] > 70:
+            final_candidates.append(c)
+            used_bases.add(base)
+            
+        if len(final_candidates) >= 3:
+            break
+    
+    logger.info(f"[AUTOSCALP] ✅ Ditemukan {len(final_candidates)} top class scalping (Exposure Filter Active).")
     return final_candidates
 
 

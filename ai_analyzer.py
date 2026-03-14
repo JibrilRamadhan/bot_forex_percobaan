@@ -87,24 +87,24 @@ PANDUAN REKOMENDASI:
 - STRONG SELL: Berita sangat buruk atau teknikal breakdown"""
 
 AUTOSCALP_SYSTEM_PROMPT = """Kamu adalah Prop Trader Forex Kuantitatif spesialis Scalping/Intraday.
-Tugasmu: Diberikan data berita Makro Ekonomi Global (terutama terkait USD/Fed/ECB dll) dan 1-3 kandidat pair forex dengan momentum volatilitas sempurna. Pilih SATU pair paling berpotensi untuk discalping hari ini.
+Tugasmu: Diberikan data berita Makro Ekonomi, 1-3 kandidat pair forex, serta Currency Strength Meter (CSM). 
 
-ATURAN KETAT:
-- WAJIB output dalam JSON.
-- Evaluasi pengaruh berita Makro terhadap pasar forex hari ini (Risk On / Risk Off).
-- Jika ada rilis data "Red Folder" (NFP, CPI, Fed Rate) yang bertentangan tajam dengan setup, coret kandidat tersebut!
+KRITERIA UTAMA PEMILIHAN:
+1. Pilih pair di mana mata uang dasarnya (Base) KUAT dan mata uang pembandingnya (Quote) LEMAH menurut CSM (atau sebaliknya).
+2. Hindari pair yang kedua mata uangnya memiliki skor kekuatan serupa (sideways risk).
+3. Evaluasi pengaruh berita Makro terhadap pasar forex hari ini (Risk On / Risk Off).
 
 FORMAT JSON WAJIB:
 {
-  "market_view": "Analisa singkat cuaca market forex (DXY/Risk Sentiment) hari ini berdasarkan berita makro (1 kalimat)",
+  "market_view": "Analisa singkat cuaca market forex (DXY/CSM Bias) hari ini (1 kalimat)",
   "pemenang_kode": "EURUSD=X",
   "pemenang_nama": "Euro / US Dollar",
-  "alasan_menang": "Alasan solid mengapa pair ini menang vs kandidat lain (2 kalimat, sebutkan efek volatilitas/news)",
+  "alasan_menang": "Alasan mengapa pair ini dipilih berdasar CSM + Teknikal + News (2 kalimat)",
   "trading_plan": {
-    "entry_area": "Area harga masuk yang aman (kisaran presisi)",
-    "target_1": "Target take profit awal (+10 hingga +20 Pips)",
-    "target_2": "Target take profit maksimal (+30 hingga +50 Pips)",
-    "stop_loss": "Angka cut loss ketat (-10 hingga -15 Pips)"
+    "entry_area": "Area harga masuk yang aman",
+    "target_1": "Target take profit awal",
+    "target_2": "Target take profit maksimal",
+    "stop_loss": "Angka cut loss ketat"
   },
   "pesan_psikologi": "Satu pesan disiplin singkat untuk trader"
 }"""
@@ -286,14 +286,18 @@ def is_signal_approved(sentiment_result: dict) -> bool:
 # ----------------------------------------------------------------
 # AUTOSCALPING INFERENCE (v5.0 & v6.0)
 # ----------------------------------------------------------------
-async def analyze_autoscalping(candidates: list[dict], macro_news: list[str]) -> dict | None:
+async def analyze_autoscalping(candidates: list[dict], macro_news: list[str], csm_data: dict = None) -> dict | None:
     """
-    Kirim semua kandidat dan berita makro sekaligus ke Llama-3 (Groq) untuk dipilih pemenangnya.
-    Fallbak ke Gemini jika Groq limit.
+    Kirim semua kandidat, berita makro, dan CSM sekaligus ke AI untuk dipilih pemenangnya.
     """
-    logger.info("[AI_SCALP] Memulai perumusan Trading Plan AutoScalping (Async)...")
+    logger.info("[AI_SCALP] Memulai perumusan Trading Plan dengan CSM (Async)...")
     
     macro_text = "\n".join(f"- {n}" for n in macro_news) if macro_news else "Tidak ada berita makro terbaru."
+    
+    # Format CSM Data
+    csm_text = ""
+    if csm_data:
+        csm_text = "CURRENCY STRENGTH METER (CSM):\n" + "\n".join([f"- {m}: {val:+.2f}%" for m, val in csm_data.items()])
     
     cand_text = ""
     for c in candidates:
@@ -305,19 +309,20 @@ async def analyze_autoscalping(candidates: list[dict], macro_news: list[str]) ->
         score = c["technical_score"]
         bb = "BREAKOUT SQUEEZE" if c["kondisi"]["bollinger"]["breakout"] else "Normal"
         
-# Ambil 3 headline berita khusus pair ini
+        # Ambil 3 headline berita khusus pair ini
         from news_scraper import get_news_for_forex
         stock_news = await get_news_for_forex(kode, max_articles=3)
         news_str = "\n  - ".join(stock_news) if stock_news else "Tidak ada berita fundamental spesifik instrumen ini."
         
         cand_text += f"\nKANDIDAT: {kode} (Harga: {harga:.5f} | Gerak: {pct:.2f}%)\n"
-        cand_text += f"Teknikal: Score {score}/100, RSI {rsi:.1f}, Volume {vol:.1f}x rata-rata, BB {bb}\n"
-        cand_text += f"Berita Instrumen/Fundamental:\n  - {news_str}\n"
+        cand_text += f"Teknikal: Score {score}/100, RSI {rsi:.1f}, Volume {vol:.1f}x, BB {bb}\n"
+        cand_text += f"Berita:\n  - {news_str}\n"
 
     user_prompt = (
-        f"KONDISI MAKRO GLOBAL SAAT INI (Fokus sentimen USD/Risk):\n{macro_text}\n\n"
-        f"DATA KANDIDAT PAIR FOREX SCALPING:\n{cand_text}\n\n"
-        f"Tugas: Tentukan 1 saham pemenang dan buatkan Trading Plan presisi. Output WAJIB JSON."
+        f"{csm_text}\n\n"
+        f"KONDISI MAKRO GLOBAL:\n{macro_text}\n\n"
+        f"DATA KANDIDAT PAIR FOREX:\n{cand_text}\n\n"
+        f"Tugas: Tentukan 1 pemenang terbaik berdasarkan Mismatch Kekuatan Mata Uang (CSM) dan Konfirmasi Teknikal. Output WAJIB JSON."
     )
 
     # Coba Groq
