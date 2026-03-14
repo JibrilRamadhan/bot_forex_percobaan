@@ -246,7 +246,8 @@ def build_screening_message(screening_data: dict, sentiment_data: dict, headline
     tp = risk.get("target_price", 0)
     rr = risk.get("risk_reward", 0)
     atr = risk.get("atr", 0)
-    sl_pips = risk.get("risiko_pips", 0)
+    sl_pips = risk.get("stop_pips", 0)
+    lot = risk.get("recommended_lot", 0.01)
     sl_str = f"{sl:.5f} ({sl_pips:.1f} Pips)" if sl > 0 else "N/A"
     tp_str = f"{tp:.5f}" if tp > 0 else "N/A"
     rr_str = f"1 : {rr:.1f}" if rr > 0 else "N/A"
@@ -297,6 +298,7 @@ def build_screening_message(screening_data: dict, sentiment_data: dict, headline
 🛑 Stop Loss: <code>{sl_str}</code>
 {EMOJI['target']} Target: <code>{tp_str}</code>
 ⚖️ Risk/Reward: <b>{rr_str}</b>
+📦 Recommended Lot: <b>{lot:.2f}</b> (Risk 1%)
 
 ━━━━━━━━━━━━━━━━━━━━━━━━
 {EMOJI['target']} <b>SUPPORT & RESISTANCE</b>
@@ -674,11 +676,13 @@ async def cmd_signals(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             bb_txt = " ⚡SQUEEZE" if c["kondisi"]["bollinger"]["squeeze"] else ""
             filled = round(score / 10)
             bar = "█" * filled + "░" * (10 - filled)
+            lot = c["risk_management"]["recommended_lot"]
             baris.append(
                 f"<b>{i}. {kode}</b>{bb_txt}\n"
                 f"   💰 <code>{harga:.5f}</code> 📈 <b>+{pct:.2f}%</b> | Vol ×{vol_ratio:.1f}\n"
                 f"   [{bar}] <b>{score}/100</b>\n"
-                f"   🛑 SL: <code>{sl:.5f}</code> | 🎯 TP: <code>{tp:.5f}</code>"
+                f"   🛑 SL: <code>{sl:.5f}</code> | 🎯 TP: <code>{tp:.5f}</code>\n"
+                f"   📦 Recommended Lot: <b>{lot:.2f}</b> (Risk 1%)"
             )
 
         teks = (
@@ -786,6 +790,15 @@ async def cmd_heatmap(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         txt = f"🌐 <b>FOREX HEATMAP</b>\n"
         txt += f"<i>Update: {waktu}</i>\n"
         txt += f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        
+        # 0. Currency Strength Meter (CSM)
+        if data.get("csm"):
+            txt += f"📊 <b>CURRENCY STRENGTH METER (CSM)</b>\n"
+            txt += f"<i>Relative Strength vs Market Average</i>\n"
+            for m, val in data["csm"].items():
+                emoji = "🟦" if val >= 0.5 else "🟩" if val >= 0.1 else "⬜" if val >= -0.1 else "🟧" if val >= -0.5 else "🟥"
+                txt += f"{emoji} <b>{m}</b>: <code>{val:+.2f}%</code>\n"
+            txt += "\n"
 
         # 1. Top Gainers
         txt += f"🚀 <b>MOST BULLISH PAIRS</b>\n"
@@ -912,6 +925,7 @@ async def _run_autoscalping(update: Update, context: ContextTypes.DEFAULT_TYPE, 
             f"🚀 <b>TARGET 2:</b> <code>{t2}</code>\n"
             f"🛑 <b>CUT LOSS:</b> <code>{sl}</code>\n\n"
             
+            f"📦 <b>RECOMMENDED LOT: {plan.get('lot_size', '0.01' if not candidates else candidates[0]['risk_management']['recommended_lot'])}</b> (Risk 1%)\n"
             f"⚠️ <b>Pesan AI:</b> <i>{psikologi}</i>\n"
             f"💡 <i>DYOR! by JR</i>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━\n"

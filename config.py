@@ -59,6 +59,8 @@ VOLUME_SMA: int = 20
 ATR_PERIOD: int = 14
 ATR_MULTIPLIER: float = 1.5
 RISK_REWARD_RATIO: float = 1.3
+DEFAULT_EQUITY: float = 1000.0  # Default balance user $1000
+RISK_PER_TRADE_PCT: float = 1.0 # Risiko 1% per posisi
 
 RSI_OVERBOUGHT: float = 70.0
 VOLUME_SURGE_MULTIPLIER: float = 1.1  # Forex volume is different
@@ -95,6 +97,10 @@ SESSION_LONDON_END = 22
 # New York: 19:00 - 03:00 WIB
 SESSION_NY_START = 19
 SESSION_NY_END = 3
+
+# Golden Hours (London/NY Overlap): 19:00 - 22:00 WIB
+SESSION_GOLDEN_START = 19
+SESSION_GOLDEN_END = 22
 
 MARKET_OPEN_HOUR: int = 0   # Forex is 24h
 MARKET_CLOSE_HOUR: int = 24

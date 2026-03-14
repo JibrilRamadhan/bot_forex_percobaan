@@ -12,6 +12,7 @@ Perubahan v2.0:
 import time
 import logging
 import pandas as pd
+from datetime import datetime
 import ta
 import yfinance as yf
 import numpy as np
@@ -276,9 +277,31 @@ def detect_signal(df: pd.DataFrame) -> dict:
 
 
 # ----------------------------------------------------------------
-# ATR STOP LOSS & TARGET
+# ATR STOP LOSS & TARGET & LOT CALCULATION (v7.0)
 # ----------------------------------------------------------------
-def calculate_risk_management(df: pd.DataFrame, harga: float) -> dict:
+def calculate_lot_size(equity: float, risk_pct: float, sl_pips: float, ticker: str) -> float:
+    """
+    Hitung Lot Size agar risiko tetap (Risk Management).
+    Formula: RiskAmount / (SL_Pips * PipValue_per_standard_lot)
+    Standard Lot = 100,000 units.
+    Pip Value per Standard Lot (untuk XXX/USD) = $10.
+    """
+    if sl_pips <= 0:
+        return 0.01
+        
+    risk_amount = equity * (risk_pct / 100)
+    
+    # Estimasi Pip Value (Standard Lot 100k)
+    # Untuk XXX/USD = $10. Untuk JPY pairs = variable tapi bisa di-proxied $10.
+    pip_value_std = 10.0 
+    
+    # Lot = Risk / (SL * PipValue)
+    lot = risk_amount / (sl_pips * pip_value_std)
+    
+    # Pembulatan di Forex biasanya 0.01 (Micro Lot)
+    return max(0.01, round(lot, 2))
+
+def calculate_risk_management(df: pd.DataFrame, harga: float, ticker: str = "EURUSD=X") -> dict:
     """
     Hitung Stop Loss dinamis berdasarkan ATR dan Target Price.
     Stop Loss = harga - (ATR_MULTIPLIER × ATR)
@@ -292,15 +315,20 @@ def calculate_risk_management(df: pd.DataFrame, harga: float) -> dict:
         target = harga + (config.ATR_MULTIPLIER * atr * config.RISK_REWARD_RATIO)
         
         # Hitung jarak dalam Pip
-        multiplier = get_pip_multiplier("EURUSD=X") # Default, multiplier handles generic pairs
-        # Try to guess multiplier from price if needed (e.g. 1xx.x is likely JPY)
-        if harga > 50: multiplier = 100.0
-        else: multiplier = 10000.0
-
+        multiplier = get_pip_multiplier(ticker)
+        
         risiko_pips = abs(harga - stop_loss) * multiplier
         potensi_pips = abs(target - harga) * multiplier
         
         rr = round(potensi_pips / risiko_pips, 2) if risiko_pips > 0 else 0
+        
+        # v7.0 Position Sizing
+        recommended_lot = calculate_lot_size(
+            config.DEFAULT_EQUITY, 
+            config.RISK_PER_TRADE_PCT, 
+            risiko_pips, 
+            ticker
+        )
         
         return {
             "atr": round(atr, 6),
@@ -309,12 +337,13 @@ def calculate_risk_management(df: pd.DataFrame, harga: float) -> dict:
             "stop_pips": round(risiko_pips, 1),
             "target_pips": round(potensi_pips, 1),
             "risk_reward": rr,
+            "recommended_lot": recommended_lot
         }
     except Exception as e:
         logger.warning(f"[RISK] Error kalkulasi risk management: {e}")
         return {
             "atr": 0, "stop_loss": harga, "target_price": harga,
-            "stop_pips": 0, "target_pips": 0, "risk_reward": 0
+            "stop_pips": 0, "target_pips": 0, "risk_reward": 0, "recommended_lot": 0.01
         }
 
 
@@ -421,7 +450,7 @@ def full_screening(kode_saham: str) -> Optional[dict]:
     daily_trend = get_daily_trend(ticker)
 
     # 5. Risk Management (ATR-based)
-    risk = calculate_risk_management(df, harga)
+    risk = calculate_risk_management(df, harga, ticker)
 
     # 6. Pivot Points
     pivots = calculate_pivot_points(df)
@@ -534,7 +563,7 @@ def quick_scan(kode_saham: str, df: pd.DataFrame) -> dict | None:
         harga_ref = float(df_ind.iloc[-lookback]["close"])
         perubahan_pct = ((harga - harga_ref) / harga_ref) * 100 if harga_ref > 0 else 0
 
-        risk = calculate_risk_management(df_ind, harga)
+        risk = calculate_risk_management(df_ind, harga, kode_saham)
 
         # Score ringan tanpa daily trend
         score_ringan = calculate_technical_score(sinyal, {"uptrend_daily": False})
@@ -638,6 +667,45 @@ def scan_forex_danger(kode_list: list[str]) -> list[dict]:
     return dangerous[:10]  # Top 10
 
 
+# ----------------------------------------------------------------
+# CURRENCY STRENGTH METER (v7.0 HOLY GRAIL)
+# ----------------------------------------------------------------
+def calculate_csm(all_data: list[dict]) -> dict:
+    """
+    Kalkulasi kekuatan mata uang relatif (8 major currencies).
+    Input: all_data dari get_market_leaders (change_pct harian).
+    """
+    majors = ["USD", "EUR", "GBP", "JPY", "AUD", "NZD", "CAD", "CHF"]
+    strength = {m: {"total": 0.0, "count": 0} for m in majors}
+    
+    for d in all_data:
+        kode = d["kode"]
+        if len(kode) != 6: continue
+        
+        base, quote = kode[:3], kode[3:6]
+        change = d["change_pct"]
+        
+        # Base currency: performance sejalan dengan pair
+        if base in strength:
+            strength[base]["total"] += change
+            strength[base]["count"] += 1
+            
+        # Quote currency: performance berlawanan dengan pair
+        if quote in strength:
+            strength[quote]["total"] -= change
+            strength[quote]["count"] += 1
+            
+    # Hitung rata-rata
+    results = {}
+    for m, val in strength.items():
+        avg = val["total"] / val["count"] if val["count"] > 0 else 0.0
+        results[m] = round(avg, 2)
+        
+    # Sort dari terkuat ke terlemah
+    sorted_csm = dict(sorted(results.items(), key=lambda item: item[1], reverse=True))
+    return sorted_csm
+
+
 def get_market_leaders(kode_list: list[str]) -> dict:
     """
     (v4.0) Ambil data market leaders: Top Gainer, Top Volume, Top Value, dan Live Rebound.
@@ -700,12 +768,16 @@ def get_market_leaders(kode_list: list[str]) -> dict:
     # Sort rebound berdasarkan change terkuat
     live_rebound = sorted(live_rebound, key=lambda x: x["change_pct"], reverse=True)[:5]
     
+    # v7.0 Generate CSM
+    csm_data = calculate_csm(all_data)
+    
     logger.info("[MARKET] ✅ Berhasil mendapatkan data market leaders")
     return {
         "top_gainer": top_gainers,
         "top_volume": top_volume,
         "top_value": top_value,
-        "live_rebound": live_rebound
+        "live_rebound": live_rebound,
+        "csm": csm_data
     }
 
 
@@ -745,6 +817,15 @@ def get_autoscalping_candidates(kode_list: list[str], force: bool = False, calen
         vol_surge = quick["kondisi"]["volume"]["rasio"]
         rsi = quick["kondisi"]["rsi"]["nilai"]
         
+        # -- SESSION AWARE VOLUME FILTER (v7.0) --
+        curr_hour = datetime.now(config.WIB).hour
+        is_golden = config.SESSION_GOLDEN_START <= curr_hour < config.SESSION_GOLDEN_END
+        
+        # Jika bukan jam sibuk (Sydney/Tokyo 00-07 WIB), perketat filter volume
+        if 0 <= curr_hour < 7 and not force:
+            if vol_surge < 1.5: # Perlu lonjakan volume lebih tinggi saat sepi
+                continue
+
         # Filter awal
         if not force:
             if score < 50 or vol_surge < 1.0 or rsi >= 75:
@@ -765,6 +846,11 @@ def get_autoscalping_candidates(kode_list: list[str], force: bool = False, calen
         is_squeeze_break = full_data["kondisi"]["bollinger"]["breakout"]
         scalp_power = score + (vol_surge * 10) + (20 if is_squeeze_break else 0)
         
+        # -- SESSION OVERLAP BONUS (v7.0 HOLY GRAIL) --
+        if is_golden:
+            scalp_power += 20
+            logger.info(f"[AUTOSCALP] 🏆 {kode} mendapat Bonus Golden Hour (+20)")
+            
         # Jika DXY rally, pair XXXUSD (EURUSD, GBPUSD) biasanya drop
         if is_dxy_rallying and "USD" in full_data["kode"] and not full_data["kode"].startswith("USD"):
             scalp_power -= 20
