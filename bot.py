@@ -1097,7 +1097,7 @@ async def radar_scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                 rr = data.get("kondisi", {}).get("risk_reward", {})
                 target = rr.get("target_price_1", 0.0)
                 sl = rr.get("stop_loss_price", 0.0)
-                await log_signal("RADAR_SCAN", kode, harga, target, sl)
+                await db.log_signal("RADAR_SCAN", kode, harga, target, sl)
             except Exception as db_err:
                 logger.error(f"[DB] Error logging radar signal: {db_err}")
 
@@ -1134,7 +1134,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 # SETUP
 # ----------------------------------------------------------------
 async def post_init(application: Application) -> None:
-    await init_db()
+    await db.init_db()
     logger.info("[BOT] ✅ Terhubung ke Telegram.")
     commands = [
         BotCommand("start", "Menu utama"),
