@@ -54,6 +54,34 @@ COMMODITIES: list[str] = [
 
 FOREX_WATCHLIST: list[str] = FOREX_PAIRS_MAJOR + FOREX_PAIRS_CROSS + COMMODITIES
 
+# -------------------------------------------------------
+# WEBSOCKET — THE GOLDEN 8 (TwelveData Real-time)
+# -------------------------------------------------------
+TWELVEDATA_API_KEY: str = os.getenv("TWELVEDATA_API_KEY", "")
+
+# Map: TwelveData symbol → yfinance ticker (untuk full_screening)
+WS_GOLDEN_8: dict[str, str] = {
+    "EUR/USD":  "EURUSD=X",
+    "GBP/USD":  "GBPUSD=X",
+    "USD/JPY":  "USDJPY=X",
+    "XAU/USD":  "GC=F",       # Gold — paling wajib untuk scalping!
+    "AUD/USD":  "AUDUSD=X",
+    "USD/CAD":  "USDCAD=X",
+    "USD/CHF":  "USDCHF=X",
+    "EUR/JPY":  "EURJPY=X",
+}
+
+# Pair non-WS yang tetap di-handle oleh yfinance polling 15 menit
+WS_NON_STREAMING = [p for p in FOREX_WATCHLIST if p not in WS_GOLDEN_8.values()]
+
+# --- Signal Engine Thresholds ---
+WS_TRIGGER_PCT: float = 0.10       # Minimum pergerakan harga (0.10% = ±10 pips) dalam 5 mnt
+WS_VOLUME_SPIKE: float = 3.0       # Minimum tick volume spike multiplier
+WS_WINDOW_SECONDS: int = 300       # Lookback window untuk trigger (5 menit)
+WS_COOLDOWN_MINUTES: int = 10      # Anti-spam: min jeda antar alert per pair (menit)
+WS_ANALYSIS_QUEUE_MAX: int = 5     # Max antrian analisa AI bersamaan
+
+
 # Legacy support
 WATCHLIST = FOREX_WATCHLIST
 KOMPAS100 = FOREX_WATCHLIST 

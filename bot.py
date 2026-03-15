@@ -45,6 +45,13 @@ from ai_analyzer import (
 )
 import db_manager as db
 
+from websocket_engine import WebSocketEngine
+from signal_engine import SignalEngine
+
+# --- Globals untuk Mode B (WebSocket) ---
+ws_engine: WebSocketEngine = None
+signal_engine: SignalEngine = None
+
 # ----------------------------------------------------------------
 # LOGGING
 # ----------------------------------------------------------------
@@ -1146,13 +1153,14 @@ async def radar_scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     waktu = datetime.now(WIB).strftime("%H:%M WIB")
-    n = len(config.FOREX_WATCHLIST)
-    logger.info(f"[RADAR] 🔍 Scan {n} pair Forex — {waktu}")
+    # Mode B Hybrid: Hanya scan pair non-websocket (opsional: fallback semuanya bisa)
+    n = len(config.WS_NON_STREAMING)
+    logger.info(f"[RADAR] 🔍 Scan {n} pair Non-Streaming (yfinance polling) — {waktu}")
 
     # ── FASE 1: Bulk Download semua pair sekaligus (1 request) ──
     from data_fetcher import bulk_fetch_ohlcv, quick_scan
     data_map = await asyncio.get_event_loop().run_in_executor(
-        None, bulk_fetch_ohlcv, config.FOREX_WATCHLIST)
+        None, bulk_fetch_ohlcv, config.WS_NON_STREAMING)
     logger.info(f"[RADAR] Bulk download selesai: {len(data_map)}/{n} instrumen")
 
     # ── FASE 2: Quick scan — filter awal yang ringan ──
@@ -1246,13 +1254,54 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
     else:
         logger.error(f"[BOT] Unhandled error: {err}", exc_info=err)
 
+# ----------------------------------------------------------------
+# /STATUS (WebSocket Mode B)
+# ----------------------------------------------------------------
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Tampilkan status koneksi WebSocket dan antrian Signal Engine."""
+    global ws_engine, signal_engine
+    
+    if not ws_engine or not signal_engine:
+        await update.effective_message.reply_text("❌ WebSocket Engine belum diinisialisasi.")
+        return
+        
+    ws_state = "🟢 CONNECTED" if ws_engine.running else "🔴 DISCONNECTED"
+    tick_qsize = ws_engine.tick_queue.qsize()
+    analysis_qsize = signal_engine.analysis_queue.qsize()
+    
+    txt = (
+        f"🔌 <b>SYSTEM STATUS (Mode B)</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📡 WebSocket: {ws_state}\n"
+        f"📦 Tick Queue size: <b>{tick_qsize}</b>\n"
+        f"🧠 Analysis Queue size: <b>{analysis_qsize}</b>\n\n"
+        f"🌟 <b>The Golden 8 (Real-time):</b>\n"
+        f"{', '.join(config.WS_GOLDEN_8.keys())}\n\n"
+        f"💤 <b>Polling 15m (yfinance):</b>\n"
+        f"{len(config.WS_NON_STREAMING)} pasang lainnya.\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━"
+    )
+    await update.effective_message.reply_text(txt, parse_mode=ParseMode.HTML)
+
 
 # ----------------------------------------------------------------
 # SETUP
 # ----------------------------------------------------------------
 async def post_init(application: Application) -> None:
     await db.init_db()
-    logger.info("[BOT] ✅ Terhubung ke Telegram.")
+    
+    global ws_engine, signal_engine
+    tick_queue = asyncio.Queue()
+    
+    # Init engines
+    ws_engine = WebSocketEngine(tick_queue)
+    signal_engine = SignalEngine(tick_queue, application)
+    
+    # Start engines
+    await signal_engine.start()
+    await ws_engine.start()
+    
+    logger.info("[BOT] ✅ Terhubung ke Telegram dan Mode B Engines dimulai.")
     commands = [
         BotCommand("start", "Menu utama"),
         BotCommand("autoscalping", "AI Trading Plan Otomatis (v2.0)"),
@@ -1264,6 +1313,7 @@ async def post_init(application: Application) -> None:
         BotCommand("calendar", "Jadwal berita ekonomi hari ini"),
         BotCommand("winrate", "Statistik Win Rate bot"),
         BotCommand("settings", "Konfigurasi equity & risiko (live)"),
+        BotCommand("status", "Cek status Engine & WebSocket"),
         BotCommand("watchlist", "Pantauan instrumen"),
         BotCommand("help", "Panduan penggunaan v2.0"),
     ]
@@ -1371,6 +1421,7 @@ def main() -> None:
     application.add_handler(CommandHandler("calendar", cmd_calendar))
     application.add_handler(CommandHandler("winrate", cmd_winrate))
     application.add_handler(CommandHandler("settings", cmd_settings))
+    application.add_handler(CommandHandler("status", cmd_status))
     application.add_handler(CallbackQueryHandler(handle_callback))
 
     job_queue = application.job_queue
