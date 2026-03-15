@@ -19,6 +19,7 @@ import json
 import logging
 import functools
 from datetime import datetime
+from contextlib import asynccontextmanager
 
 logger = logging.getLogger(__name__)
 
@@ -50,12 +51,13 @@ def db_retry(max_attempts: int = 3, delay: float = 0.15):
 # ----------------------------------------------------------------
 # HELPER: Connection dengan WAL + Busy Timeout
 # ----------------------------------------------------------------
+@asynccontextmanager
 async def _get_db():
     """Buat koneksi SQLite dengan WAL mode dan busy timeout yang aman."""
-    db = await aiosqlite.connect(DB_PATH)
-    await db.execute("PRAGMA journal_mode=WAL")
-    await db.execute("PRAGMA busy_timeout=5000")
-    return db
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("PRAGMA journal_mode=WAL")
+        await db.execute("PRAGMA busy_timeout=5000")
+        yield db
 
 
 # ----------------------------------------------------------------
@@ -63,7 +65,7 @@ async def _get_db():
 # ----------------------------------------------------------------
 async def init_db():
     try:
-        async with await _get_db() as db:
+        async with _get_db() as db:
             # 1. Tabel Cache Sentimen AI
             await db.execute('''
                 CREATE TABLE IF NOT EXISTS sentiment_cache (
@@ -123,7 +125,7 @@ async def init_db():
 async def get_cached_sentiment(kode: str, ttl_minutes: int) -> dict | None:
     """Ambil cache AI jika belum expired."""
     try:
-        async with await _get_db() as db:
+        async with _get_db() as db:
             async with db.execute('SELECT hasil_json, timestamp FROM sentiment_cache WHERE kode = ?', (kode,)) as cursor:
                 row = await cursor.fetchone()
                 if not row:
@@ -148,7 +150,7 @@ async def get_cached_sentiment(kode: str, ttl_minutes: int) -> dict | None:
 @db_retry()
 async def save_cached_sentiment(kode: str, result_dict: dict) -> None:
     """Simpan hasil analisa AI ke database."""
-    async with await _get_db() as db:
+    async with _get_db() as db:
         hasil_json = json.dumps(result_dict)
         ts = datetime.now().isoformat()
         await db.execute('''
@@ -165,7 +167,7 @@ async def save_cached_sentiment(kode: str, result_dict: dict) -> None:
 @db_retry()
 async def log_signal(tipe_sinyal: str, kode: str, harga_masuk: float, target: float, stop_loss: float):
     """Mencatat sinyal Trading yang dikeluarkan bot ke dalam jurnal."""
-    async with await _get_db() as db:
+    async with _get_db() as db:
         ts = datetime.now().isoformat()
         await db.execute('''
             INSERT INTO signal_history (tanggal, tipe_sinyal, kode, harga_masuk, target_1, stop_loss)
@@ -178,7 +180,7 @@ async def log_signal(tipe_sinyal: str, kode: str, harga_masuk: float, target: fl
 async def get_open_signals():
     """Mengambil semua sinyal yang masih berstatus OPEN."""
     try:
-        async with await _get_db() as db:
+        async with _get_db() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute('SELECT * FROM signal_history WHERE status = "OPEN"') as cursor:
                 return await cursor.fetchall()
@@ -190,7 +192,7 @@ async def get_open_signals():
 @db_retry()
 async def update_signal_status(signal_id: int, status: str, pl: float = 0.0):
     """Update status sinyal (WIN/LOSS) dan simpan P/L."""
-    async with await _get_db() as db:
+    async with _get_db() as db:
         await db.execute('''
             UPDATE signal_history 
             SET status = ?, profit_loss = ? 
@@ -203,7 +205,7 @@ async def update_signal_status(signal_id: int, status: str, pl: float = 0.0):
 async def get_signal_stats():
     """Mengambil statistik performa bot (Win Rate)."""
     try:
-        async with await _get_db() as db:
+        async with _get_db() as db:
             async with db.execute('SELECT COUNT(*) FROM signal_history WHERE status != "OPEN"') as cursor:
                 total = (await cursor.fetchone())[0]
             async with db.execute('SELECT COUNT(*) FROM signal_history WHERE status = "WIN"') as cursor:
@@ -230,7 +232,7 @@ _SETTINGS_DEFAULTS = {
 async def get_setting(key: str) -> str:
     """Ambil setting dari DB. Fallback ke default jika tidak ada."""
     try:
-        async with await _get_db() as db:
+        async with _get_db() as db:
             async with db.execute('SELECT value FROM user_settings WHERE key = ?', (key,)) as cursor:
                 row = await cursor.fetchone()
                 if row:
@@ -243,7 +245,7 @@ async def get_setting(key: str) -> str:
 @db_retry()
 async def set_setting(key: str, value: str) -> None:
     """Simpan atau update setting user ke DB."""
-    async with await _get_db() as db:
+    async with _get_db() as db:
         ts = datetime.now().isoformat()
         await db.execute('''
             INSERT OR REPLACE INTO user_settings (key, value, updated_at)
@@ -257,7 +259,7 @@ async def get_all_settings() -> dict:
     """Ambil semua settings yang ada di DB."""
     result = dict(_SETTINGS_DEFAULTS)
     try:
-        async with await _get_db() as db:
+        async with _get_db() as db:
             async with db.execute('SELECT key, value FROM user_settings') as cursor:
                 rows = await cursor.fetchall()
                 for row in rows:
