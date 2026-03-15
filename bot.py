@@ -16,6 +16,7 @@ import io
 import gc
 import os
 from datetime import datetime, time as dtime
+from concurrent.futures import ProcessPoolExecutor
 
 import matplotlib
 matplotlib.use("Agg")  # Non-interactive backend (wajib untuk server tanpa display)
@@ -51,6 +52,7 @@ from signal_engine import SignalEngine
 # --- Globals untuk Mode B (WebSocket) ---
 ws_engine: WebSocketEngine = None
 signal_engine: SignalEngine = None
+cpu_pool = ProcessPoolExecutor(max_workers=2)
 
 # ----------------------------------------------------------------
 # LOGGING
@@ -612,7 +614,7 @@ async def cmd_screening(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             try:
                 chart_buf = await asyncio.wait_for(
                     asyncio.get_event_loop().run_in_executor(
-                        None, generate_chart, screening_data["df"], kode_input, screening_data),
+                        cpu_pool, generate_chart, screening_data["df"], kode_input, screening_data),
                     timeout=15.0
                 )
             except asyncio.TimeoutError:

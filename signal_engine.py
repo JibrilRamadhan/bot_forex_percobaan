@@ -10,10 +10,14 @@ signal_engine.py - Event-Driven Trigger & Analysis Engine (Mode B)
 import asyncio
 import logging
 from datetime import datetime, timedelta
+from concurrent.futures import ProcessPoolExecutor
 import config
 from data_fetcher import full_screening
 
 logger = logging.getLogger(__name__)
+
+# Global Process Pool untuk mencegah Matplotlib memblokir GIL (Event Loop)
+cpu_pool = ProcessPoolExecutor(max_workers=2)
 
 class SignalEngine:
     def __init__(self, tick_queue: asyncio.Queue, bot_app):
@@ -28,7 +32,8 @@ class SignalEngine:
             self.symbol_state[gw] = {
                 "last_price": 0.0,
                 "prices_5m": [],          # list of (timestamp, price)
-                "avg_volume": 0.0,
+                "tick_volumes_5m": [],    # list of (timestamp, tick_volume)
+                "last_day_volume": 0.0,   # Untuk menghitung delta tick volume
                 "last_alert_time": None,
                 "ticks_received": 0
             }
@@ -62,40 +67,66 @@ class SignalEngine:
                 state = self.symbol_state[symbol]
                 current_price = tick["price"]
                 current_time = datetime.now()
+                current_day_vol = tick["day_volume"]
+                
+                # Hitung TICK VOLUME (selisih day_volume sekarang vs sebelumnya)
+                prev_day_vol = state.get("last_day_volume", 0.0)
+                if prev_day_vol == 0.0:
+                    tick_volume = 0.0
+                else:
+                    tick_volume = current_day_vol - prev_day_vol
+                    if tick_volume < 0:
+                        tick_volume = 0.0 # Reset saat berganti hari
+                
+                state["last_day_volume"] = current_day_vol
                 
                 # Update historikal 5 menit
                 state["prices_5m"].append((current_time, current_price))
+                state["tick_volumes_5m"].append((current_time, tick_volume))
                 
                 # Cleanup data lebih tua dari 5 menit
                 cutoff_time = current_time - timedelta(seconds=config.WS_WINDOW_SECONDS)
                 state["prices_5m"] = [p for p in state["prices_5m"] if p[0] >= cutoff_time]
+                state["tick_volumes_5m"] = [v for v in state["tick_volumes_5m"] if v[0] >= cutoff_time]
                 
                 # Mulai analisa jika data sudah cukup (minimal 1 menit tick data)
                 if len(state["prices_5m"]) > 10:
                     oldest_price = state["prices_5m"][0][1]
                     price_change_pct = abs((current_price - oldest_price) / oldest_price) * 100
                     
-                    # Cek Threshold Guard (>0.1%)
-                    if price_change_pct >= config.WS_TRIGGER_PCT:
+                    # Hitung rata-rata tick volume 5 menit terakhir
+                    all_vols = [v[1] for v in state["tick_volumes_5m"]]
+                    avg_tick_vol = sum(all_vols) / len(all_vols) if all_vols else 0
+                    
+                    # Cek Threshold Guard (>0.1% ATAU Volume Surge 3x)
+                    is_price_surge = price_change_pct >= config.WS_TRIGGER_PCT
+                    is_volume_surge = (tick_volume > (avg_tick_vol * config.WS_VOLUME_SPIKE)) and (avg_tick_vol > 0)
+                    
+                    if is_price_surge or is_volume_surge:
                         # Cek Cooldown Guard (10 menit)
                         last_alert = state["last_alert_time"]
                         if not last_alert or (current_time - last_alert).total_seconds() > (config.WS_COOLDOWN_MINUTES * 60):
                             
-                            logger.warning(
-                                f"[SIGNAL] ⚡ TRIGGER: {symbol} bergerak {price_change_pct:.3f}% "
-                                f"({oldest_price} → {current_price}) dalam <5m!"
-                            )
+                            trigger_reason = "PRICE_SURGE" if is_price_surge else "VOLUME_SURGE"
+                            log_msg = f"[SIGNAL] ⚡ TRIGGER: {symbol} "
+                            if is_price_surge:
+                                log_msg += f"bergerak {price_change_pct:.3f}% ({oldest_price} → {current_price}) dalam <5m!"
+                            else:
+                                log_msg += f"Volume Spike! Tick Vol: {tick_volume:.1f} (Avg: {avg_tick_vol:.1f})"
+                            
+                            logger.warning(log_msg)
                             
                             # Update state
                             state["last_alert_time"] = current_time
                             state["prices_5m"].clear() # Reset window setelah trigger
+                            state["tick_volumes_5m"].clear()
                             
                             # Kirim ke Analysis Queue
                             try:
                                 self.analysis_queue.put_nowait({
                                     "symbol": symbol,
                                     "yf_ticker": tick["yf_ticker"],
-                                    "trigger_type": "PRICE_SURGE",
+                                    "trigger_type": trigger_reason,
                                     "change_pct": price_change_pct,
                                     "current_price": current_price
                                 })
@@ -159,7 +190,7 @@ class SignalEngine:
                 try:
                     chart_buf = await asyncio.wait_for(
                         asyncio.get_event_loop().run_in_executor(
-                            None, generate_chart, data["df"], yf_ticker, data
+                            cpu_pool, generate_chart, data["df"], yf_ticker, data
                         ),
                         timeout=15.0
                     )
