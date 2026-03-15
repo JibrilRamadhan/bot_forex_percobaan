@@ -1,11 +1,11 @@
 """
-ai_analyzer.py - Groq (Primary) + Gemini (Fallback) dengan Buy/Sell Recommendation (v2.0)
-==========================================================================================
+ai_analyzer.py - Groq (Primary) + Gemini (Fallback) dengan Circuit Breaker (v3.0)
+====================================================================================
 Arsitektur:
   1. Groq LLaMA-3.3-70B (Primary, 30 RPM gratis, < 1 detik)
-  2. Gemini 2.0-Flash (Fallback, 15 RPM)
-  3. Cache 30 menit per saham
-  4. AI memberikan: sentimen + rekomendasi BUY/HOLD/SELL + alasan
+  2. Gemini 2.0-Flash (Fallback otomatis + Failover 60 menit)
+  3. Circuit Breaker: 3 gagal berturut-turut → Groq diblokir 60 menit
+  4. Cache 30 menit per instrumen di SQLite
 """
 
 import json
@@ -18,6 +18,13 @@ from datetime import datetime, timedelta
 from groq import Groq
 from google import genai
 from google.genai import types
+from tenacity import (
+    retry,
+    stop_after_attempt,
+    wait_exponential,
+    retry_if_exception_type,
+    RetryError,
+)
 
 import config
 
@@ -46,6 +53,54 @@ def get_gemini_client() -> genai.Client:
             raise ValueError("GEMINI_API_KEY belum diset di environment variables")
         _gemini_client = genai.Client(api_key=config.GEMINI_API_KEY)
     return _gemini_client
+
+
+# ----------------------------------------------------------------
+# CIRCUIT BREAKER STATE
+# ----------------------------------------------------------------
+_groq_failure_count: int = 0
+_groq_disabled_until: datetime | None = None
+_GROQ_FAILURE_THRESHOLD = 3
+_GROQ_COOLDOWN_MINUTES = 60
+
+
+def _is_groq_circuit_open() -> bool:
+    """Return True jika Groq sedang dalam kondisi diblokir (circuit open)."""
+    global _groq_disabled_until
+    if _groq_disabled_until is None:
+        return False
+    if datetime.now() >= _groq_disabled_until:
+        # Cooldown selesai — reset circuit
+        logger.info("[CIRCUIT] ✅ Groq circuit CLOSED kembali setelah cooldown.")
+        _reset_groq_circuit()
+        return False
+    return True
+
+
+def _record_groq_failure():
+    """Catat satu kegagalan Groq dan buka circuit jika threshold tercapai."""
+    global _groq_failure_count, _groq_disabled_until
+    _groq_failure_count += 1
+    logger.warning(f"[CIRCUIT] ⚡ Groq failure #{_groq_failure_count}/{_GROQ_FAILURE_THRESHOLD}")
+    if _groq_failure_count >= _GROQ_FAILURE_THRESHOLD:
+        _groq_disabled_until = datetime.now() + timedelta(minutes=_GROQ_COOLDOWN_MINUTES)
+        logger.error(
+            f"[CIRCUIT] 🔴 Groq circuit OPEN! Diblokir {_GROQ_COOLDOWN_MINUTES} menit "
+            f"hingga {_groq_disabled_until.strftime('%H:%M:%S')}. Semua request → Gemini."
+        )
+
+
+def _record_groq_success():
+    """Reset failure counter saat Groq berhasil."""
+    global _groq_failure_count
+    if _groq_failure_count > 0:
+        _groq_failure_count = 0
+
+
+def _reset_groq_circuit():
+    global _groq_failure_count, _groq_disabled_until
+    _groq_failure_count = 0
+    _groq_disabled_until = None
 
 
 # ----------------------------------------------------------------
@@ -135,44 +190,88 @@ def _build_prompt(kode: str, headlines: list[str], tech_context: dict | None = N
 
 
 # ----------------------------------------------------------------
-# GROQ INFERENCE
+# GROQ INFERENCE — With Circuit Breaker + tenacity Retry
 # ----------------------------------------------------------------
+class GroqRateLimitError(Exception):
+    pass
+
+
+class GroqAPIError(Exception):
+    pass
+
+
+def _call_groq_api(messages: list, max_tokens: int = 600, response_format: dict | None = None) -> str:
+    """
+    Raw Groq API call. Raises specific exceptions untuk retry logic.
+    """
+    client = get_groq_client()
+    kwargs = dict(
+        model=config.GROQ_MODEL,
+        messages=messages,
+        temperature=0.15,
+        max_tokens=max_tokens,
+    )
+    if response_format:
+        kwargs["response_format"] = response_format
+
+    response = client.chat.completions.create(**kwargs)
+    return response.choices[0].message.content.strip()
+
+
+@retry(
+    retry=retry_if_exception_type(GroqRateLimitError),
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=2, min=3, max=20),
+    reraise=False,
+)
+def _groq_with_retry(messages: list, max_tokens: int = 600, response_format: dict | None = None) -> str | None:
+    """Groq call dengan exponential backoff untuk rate limit, max 3 percobaan."""
+    try:
+        return _call_groq_api(messages, max_tokens, response_format)
+    except Exception as e:
+        err = str(e).lower()
+        if any(k in err for k in ["rate", "429", "too many", "quota", "tokens"]):
+            logger.warning(f"[CIRCUIT] Groq rate limit, akan retry dengan backoff: {e}")
+            raise GroqRateLimitError(str(e))
+        # Error lain (bukan rate limit) — langsung raise untuk ditangani Circuit Breaker
+        raise GroqAPIError(str(e)) from e
+
+
 def _analyze_groq(kode: str, headlines: list[str], tech_ctx: dict | None) -> dict | None:
+    """
+    Groq inference dengan Circuit Breaker protection.
+    - Circuit OPEN → langsung return None (bypass, tidak ada delay)
+    - Circuit CLOSED → coba Groq, tangani kegagalan, update state
+    """
     if not config.GROQ_API_KEY:
-        logger.warning("[AI] GROQ_API_KEY tidak diset — skip Groq")
         return None
 
-    user_prompt = _build_prompt(kode, headlines, tech_ctx)
+    if _is_groq_circuit_open():
+        logger.warning(f"[CIRCUIT] 🔴 Groq circuit OPEN, skip untuk {kode} → Gemini")
+        return None
 
-    for attempt in range(1, 3):
-        try:
-            logger.info(f"[AI] 🔵 Groq {config.GROQ_MODEL} → {kode} (try {attempt})")
-            client = get_groq_client()
-            chat = client.chat.completions.create(
-                model=config.GROQ_MODEL,
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": user_prompt},
-                ],
-                temperature=0.15,
-                max_tokens=600,
-                response_format={"type": "json_object"},
-            )
-            text = chat.choices[0].message.content.strip()
-            result = _parse(text)
-            logger.info(f"[AI] ✅ Groq → {kode}: {result['sentimen']} | {result['rekomendasi']} ({result['skor_keyakinan']}/10)")
-            return result
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": _build_prompt(kode, headlines, tech_ctx)},
+    ]
 
-        except Exception as e:
-            err = str(e).lower()
-            if any(k in err for k in ["rate", "429", "too many", "quota", "tokens"]):
-                logger.warning(f"[AI] Groq rate limit try {attempt}/2, tunggu 10s")
-                time.sleep(10)
-            else:
-                logger.error(f"[AI] Groq error try {attempt}/2: {e}")
-                time.sleep(2)
+    try:
+        logger.info(f"[AI] 🔵 Groq {config.GROQ_MODEL} → {kode}")
+        text = _groq_with_retry(messages, max_tokens=600, response_format={"type": "json_object"})
+        if text is None:
+            _record_groq_failure()
+            return None
+        result = _parse(text)
+        _record_groq_success()
+        logger.info(f"[AI] ✅ Groq → {kode}: {result['sentimen']} | {result['rekomendasi']} ({result['skor_keyakinan']}/10)")
+        return result
+    except (RetryError, GroqRateLimitError):
+        logger.warning(f"[CIRCUIT] Groq habis retry untuk {kode}")
+        _record_groq_failure()
+    except Exception as e:
+        logger.error(f"[AI] Groq non-retryable error untuk {kode}: {e}")
+        _record_groq_failure()
 
-    logger.warning("[AI] Groq gagal → pindah ke Gemini fallback")
     return None
 
 
@@ -325,32 +424,37 @@ async def analyze_autoscalping(candidates: list[dict], macro_news: list[str], cs
         f"Tugas: Tentukan 1 pemenang terbaik berdasarkan Mismatch Kekuatan Mata Uang (CSM) dan Konfirmasi Teknikal. Output WAJIB JSON."
     )
 
-    # Coba Groq
-    if config.GROQ_API_KEY:
+    # Coba Groq (dengan circuit breaker)
+    if config.GROQ_API_KEY and not _is_groq_circuit_open():
         try:
-            client = get_groq_client()
-            loop = asyncio.get_event_loop()
-            chat = await loop.run_in_executor(None, lambda: client.chat.completions.create(
-                model=config.GROQ_MODEL,
-                messages=[
-                    {"role": "system", "content": AUTOSCALP_SYSTEM_PROMPT},
-                    {"role": "user", "content": user_prompt},
-                ],
-                temperature=0.2, # Sedikit dinaikkan agar analitis
-                max_tokens=800,
-                response_format={"type": "json_object"},
-            ))
-            text = chat.choices[0].message.content.strip()
-            return json.loads(text)
+            messages = [
+                {"role": "system", "content": AUTOSCALP_SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt},
+            ]
+            logger.info("[AI_SCALP] 🔵 Groq → AutoScalping Trading Plan")
+            text = _groq_with_retry(messages, max_tokens=800, response_format={"type": "json_object"})
+            if text:
+                _record_groq_success()
+                logger.info("[AI_SCALP] ✅ Groq AutoScalping Plan siap.")
+                return json.loads(text)
+            else:
+                _record_groq_failure()
+        except (RetryError, GroqRateLimitError):
+            logger.warning("[CIRCUIT] [AI_SCALP] Groq habis retry untuk AutoScalping")
+            _record_groq_failure()
         except Exception as e:
             logger.error(f"[AI_SCALP] Groq error: {e}")
-            
-    # Coba Gemini
+            _record_groq_failure()
+    elif _is_groq_circuit_open():
+        logger.warning("[CIRCUIT] [AI_SCALP] 🔴 Groq circuit OPEN → langsung Gemini")
+
+    # Coba Gemini fallback
     if config.GEMINI_API_KEY:
         try:
             client = get_gemini_client()
             full_prompt = f"{AUTOSCALP_SYSTEM_PROMPT}\n\n{user_prompt}"
             loop = asyncio.get_event_loop()
+            logger.info("[AI_SCALP] 🟡 Gemini fallback → AutoScalping Trading Plan")
             response = await loop.run_in_executor(None, lambda: client.models.generate_content(
                 model=config.GEMINI_MODEL,
                 contents=full_prompt,
@@ -361,11 +465,12 @@ async def analyze_autoscalping(candidates: list[dict], macro_news: list[str], cs
                     response_mime_type="application/json"
                 ),
             ))
+            logger.info("[AI_SCALP] ✅ Gemini AutoScalping Plan siap.")
             return json.loads(response.text.strip())
         except Exception as e:
             logger.error(f"[AI_SCALP] Gemini error: {e}")
 
-    logger.error("[AI_SCALP] Gagal mendapatkan Trading Plan dari semua AI.")
+    logger.error("[AI_SCALP] ❌ Gagal mendapatkan Trading Plan dari semua AI.")
     return None
 
 

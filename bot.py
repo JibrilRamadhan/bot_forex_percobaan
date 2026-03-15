@@ -598,12 +598,19 @@ async def cmd_screening(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             }
             sentiment_data = await analyze_sentiment(kode_input, headlines, tech_ctx)
 
-            # Step 4: Generate chart
+            # Step 4: Generate chart with timeout (15s graceful degradation)
             await loading_msg.edit_text(
                 f"{EMOJI['chart']} <b>[4/4]</b> Membuat chart candlestick...",
                 parse_mode=ParseMode.HTML)
-            chart_buf = await asyncio.get_event_loop().run_in_executor(
-                None, generate_chart, screening_data["df"], kode_input, screening_data)
+            try:
+                chart_buf = await asyncio.wait_for(
+                    asyncio.get_event_loop().run_in_executor(
+                        None, generate_chart, screening_data["df"], kode_input, screening_data),
+                    timeout=15.0
+                )
+            except asyncio.TimeoutError:
+                logger.warning(f"[CHART] Chart timeout untuk {kode_input} — kirim teks saja")
+                chart_buf = None
 
             # Build message
             pesan = build_screening_message(screening_data, sentiment_data, headlines)
@@ -747,7 +754,7 @@ async def cmd_signals(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             + "\n\n".join(baris)
             + f"\n\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"{EMOJI['clock']} {waktu}\n"
-            f"{EMOJI['info']} <i>Gunakan /screening [KODE] untuk analisa chart lengkap. by JR</i>"
+            f"{EMOJI['info']} <i>Gunakan /screening [KODE] untuk analisa chart lengkap. by J</i>"
         )
         await msg.edit_text(teks, parse_mode=ParseMode.HTML)
 
@@ -803,7 +810,7 @@ async def cmd_danger(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             + "\n\n".join(baris)
             + f"\n\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"{EMOJI['clock']} {waktu}\n"
-            f"{EMOJI['info']} <i>Hindari masuk posisi pada instrumen di atas! by JR {EMOJI['shield']}</i>"
+            f"{EMOJI['info']} <i>Hindari masuk posisi pada instrumen di atas! by J {EMOJI['shield']}</i>"
         )
         await msg.edit_text(teks, parse_mode=ParseMode.HTML)
 
@@ -1032,8 +1039,84 @@ async def cmd_autoscalping_force(update: Update, context: ContextTypes.DEFAULT_T
     await _run_autoscalping(update, context, force=True)
 
 
+async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /settings — Live config tanpa restart server.
+    Usage:
+      /settings              → tampilkan setting saat ini
+      /settings equity 2000  → ubah modal trading
+      /settings risk 0.5     → ubah risiko per trade (%)
+      /settings reset        → kembalikan ke default
+    """
+    args = context.args or []
 
-async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # Tampilkan setting saat ini
+    if not args:
+        s = await db.get_all_settings()
+        txt = (
+            f"⚙️ <b>KONFIGURASI BOT SAAT INI</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"💰 Modal Trading (Equity): <b>${s.get('equity', '1000.0')}</b>\n"
+            f"🛡️ Risiko per Trade: <b>{s.get('risk_pct', '1.0')}%</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"<i>Perintah:</i>\n"
+            f"<code>/settings equity 2000</code> — ubah modal\n"
+            f"<code>/settings risk 0.5</code> — ubah risiko (%)\n"
+            f"<code>/settings reset</code> — kembalikan ke default"
+        )
+        await update.effective_message.reply_text(txt, parse_mode=ParseMode.HTML)
+        return
+
+    sub_cmd = args[0].lower()
+
+    # Reset ke default
+    if sub_cmd == "reset":
+        await db.set_setting("equity", "1000.0")
+        await db.set_setting("risk_pct", "1.0")
+        await update.effective_message.reply_text(
+            f"✅ Setting dikembalikan ke default: Modal $1000.0 | Risiko 1.0%",
+            parse_mode=ParseMode.HTML)
+        return
+
+    # Update equity
+    if sub_cmd == "equity" and len(args) >= 2:
+        try:
+            val = float(args[1])
+            if val <= 0:
+                raise ValueError
+            await db.set_setting("equity", str(val))
+            await update.effective_message.reply_text(
+                f"✅ Modal trading diubah → <b>${val:.2f}</b>\n"
+                f"Lot size pada sinyal berikutnya akan menyesuaikan.",
+                parse_mode=ParseMode.HTML)
+        except (ValueError, IndexError):
+            await update.effective_message.reply_text(
+                f"❌ Nilai tidak valid. Contoh: <code>/settings equity 2000</code>",
+                parse_mode=ParseMode.HTML)
+        return
+
+    # Update risk %
+    if sub_cmd == "risk" and len(args) >= 2:
+        try:
+            val = float(args[1])
+            if not (0.1 <= val <= 5.0):
+                raise ValueError("Risiko harus antara 0.1% - 5.0%")
+            await db.set_setting("risk_pct", str(val))
+            await update.effective_message.reply_text(
+                f"✅ Risiko per trade diubah → <b>{val}%</b>\n"
+                f"Nilai dollar risiko = ${float(await db.get_setting('equity')) * val / 100:.2f}",
+                parse_mode=ParseMode.HTML)
+        except ValueError as e:
+            await update.effective_message.reply_text(
+                f"❌ Input tidak valid: {e}. Contoh: <code>/settings risk 1.5</code>",
+                parse_mode=ParseMode.HTML)
+        return
+
+    await update.effective_message.reply_text(
+        f"❓ Perintah tidak dikenal. Ketik <code>/settings</code> untuk pilihan.",
+        parse_mode=ParseMode.HTML)
+
+
     query = update.callback_query
     await query.answer()
 
@@ -1172,15 +1255,17 @@ async def post_init(application: Application) -> None:
     logger.info("[BOT] ✅ Terhubung ke Telegram.")
     commands = [
         BotCommand("start", "Menu utama"),
-        BotCommand("autoscalping", "AI Trading Plan Otomatis (v6.0)"),
+        BotCommand("autoscalping", "AI Trading Plan Otomatis (v2.0)"),
         BotCommand("autoscalpingforce", "Paksa AI mencari setup scalping (High Risk)"),
-        BotCommand("screening", "Analisa + Chart (contoh: /screening EURUSD)"),
-        BotCommand("heatmap", "Data volatilitas Major dan Crosses"),
-        BotCommand("signals", "Top pair kandidat BUY/SELL"),
-        BotCommand("danger", "Peringatan Drop/Red Folder"),
-        BotCommand("calendar", "Jadwal berita ekonomi (v7.0)"),
+        BotCommand("screening", "Analisa + Chart (contoh: /screening EURUSD=X)"),
+        BotCommand("heatmap", "Data CSM & volatilitas market"),
+        BotCommand("signals", "Top pair kandidat BUY"),
+        BotCommand("danger", "Peringatan Flash Volatility"),
+        BotCommand("calendar", "Jadwal berita ekonomi hari ini"),
+        BotCommand("winrate", "Statistik Win Rate bot"),
+        BotCommand("settings", "Konfigurasi equity & risiko (live)"),
         BotCommand("watchlist", "Pantauan instrumen"),
-        BotCommand("help", "Panduan penggunaan"),
+        BotCommand("help", "Panduan penggunaan v2.0"),
     ]
     await application.bot.set_my_commands(commands)
 
@@ -1285,6 +1370,7 @@ def main() -> None:
     application.add_handler(CommandHandler("danger", cmd_danger))
     application.add_handler(CommandHandler("calendar", cmd_calendar))
     application.add_handler(CommandHandler("winrate", cmd_winrate))
+    application.add_handler(CommandHandler("settings", cmd_settings))
     application.add_handler(CallbackQueryHandler(handle_callback))
 
     job_queue = application.job_queue
