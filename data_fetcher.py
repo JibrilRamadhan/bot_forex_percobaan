@@ -1,576 +1,898 @@
 """
-data_fetcher.py - Data & Indikator Kuantitatif (v8.0 MT5)
-=========================================================
-Perombakan total dari arsitektur lama (yfinance) ke Direct Market Access
-menggunakan MetaTrader5 (MT5). Fokus pada kecepatan, stabilitas eksekusi,
-serta implementasi strategi "Triple Screen" oleh Alexander Elder + VWAP & Vol Surge.
+data_fetcher.py - Data & Indikator Teknikal (v2.0)
+====================================================
+Perubahan v2.0:
+- ATR-14 untuk Stop Loss dinamis
+- Bollinger Bands (20,2) + Squeeze detection
+- Multi-Timeframe: konfirmasi tren dari data Daily
+- Technical Scoring System (0-100)
+- Kalkulasi Stop Loss, Target Price, Risk/Reward otomatis
 """
 
+import time
 import logging
-import MetaTrader5 as mt5
 import pandas as pd
-import numpy as np
-import ta
-import pytz
 from datetime import datetime
+import ta
+import yfinance as yf
+import numpy as np
+from typing import Optional
+
+import config
+from news_scraper import is_kill_switch_active
 
 logger = logging.getLogger(__name__)
 
-# ----------------------------------------------------------------
-# PENGATURAN LOGGING
-# ----------------------------------------------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(message)s'
-)
 
 # ----------------------------------------------------------------
 # UTILITAS
 # ----------------------------------------------------------------
-def get_pip_multiplier(symbol: str) -> float:
-    """Helper untuk rasio jarak PIP (Forex vs JPY)."""
-    symbol_upper = symbol.upper()
-    if "JPY" in symbol_upper:
+def format_ticker(kode: str) -> str:
+    kode = kode.strip().upper()
+    # Forex major/cross often ends with =X in Yahoo Finance
+    if any(x in kode for x in ["=X", "USD", "EUR", "JPY", "GBP", "AUD", "CAD", "CHF", "NZD"]):
+        if not kode.endswith("=X") and len(kode) == 6:
+            return f"{kode}=X"
+        return kode
+    # Commodities like GC=F (Gold), CL=F (Oil)
+    if "=F" in kode:
+        return kode
+    # Fallback to .JK for stocks if any remains (though this bot is for forex)
+    if not any(x in kode for x in ["=X", "=F", "^", ".", "="]):
+         return f"{kode}.JK"
+    return kode
+
+
+def get_clean_code(ticker: str) -> str:
+    return ticker.replace(".JK", "").replace("=X", "").upper()
+
+
+def get_pip_multiplier(ticker: str) -> float:
+    """Helper untuk PIP calculation (Forex 4/5 digit vs JPY 2/3 digit)."""
+    if "JPY" in ticker:
         return 100.0  # 1 pip = 0.01
-    elif "XAU" in symbol_upper or "GOLD" in symbol_upper:
-        return 10.0   # Asumsi standar untuk XAUUSD (10 pips per dollar)
-    return 10000.0    # 1 pip = 0.0001 (Mayoritas pair forex)
+    return 10000.0    # 1 pip = 0.0001
 
 
 # ----------------------------------------------------------------
-# FUNGSI DETEKSI PRICE ACTION (Candlestick Pattern)
+# FETCH DATA
 # ----------------------------------------------------------------
-def detect_candlestick_pattern(df: "pd.DataFrame") -> str:
-    """
-    Mendeteksi pola candlestick Price Action dari 2 candle terakhir di DataFrame.
-    Menggunakan aritmatika OHLC murni—tidak memerlukan library tambahan.
-
-    Pola yang Dideteksi:
-    - BULLISH ENGULFING  : Candle hijau besar "menelan" seluruh candle merah sebelumnya.
-    - BEARISH ENGULFING  : Candle merah besar "menelan" seluruh candle hijau sebelumnya.
-    - HAMMER / PIN BAR   : Ekor bawah >= 2x body, body kecil di 2/3 atas candle.
-    - SHOOTING STAR      : Ekor atas >= 2x body, body kecil di 1/3 bawah candle.
-    - NEUTRAL            : Tidak ada pola signifikan.
-    """
-    if df is None or len(df) < 2:
-        return "NEUTRAL"
-
-    try:
-        prev = df.iloc[-2]
-        curr = df.iloc[-1]
-
-        prev_open, prev_close = prev['open'], prev['close']
-        curr_open, curr_close = curr['open'], curr['close']
-        curr_high, curr_low = curr['high'], curr['low']
-
-        curr_body       = abs(curr_close - curr_open)
-        curr_body_low   = min(curr_open, curr_close)
-        curr_body_high  = max(curr_open, curr_close)
-        curr_range      = curr_high - curr_low
-        lower_wick      = curr_body_low - curr_low
-        upper_wick      = curr_high - curr_body_high
-
-        # Hindari pembagian nol
-        if curr_range == 0 or curr_body == 0:
-            return "NEUTRAL"
-
-        # ── BULLISH ENGULFING ──────────────────────────────────────────
-        prev_was_bearish = prev_close < prev_open
-        curr_is_bullish  = curr_close > curr_open
-        if (prev_was_bearish and curr_is_bullish
-                and curr_open  < prev_close
-                and curr_close > prev_open):
-            return "BULLISH ENGULFING"
-
-        # ── BEARISH ENGULFING ──────────────────────────────────────────
-        prev_was_bullish = prev_close > prev_open
-        curr_is_bearish  = curr_close < curr_open
-        if (prev_was_bullish and curr_is_bearish
-                and curr_open  > prev_close
-                and curr_close < prev_open):
-            return "BEARISH ENGULFING"
-
-        # ── HAMMER / BULLISH PIN BAR ───────────────────────────────────
-        # Ekor bawah panjang >= 2x body, body kecil di 2/3 atas candle
-        body_position_from_low = curr_body_low - curr_low  # = lower_wick
-        if (lower_wick >= 2.0 * curr_body
-                and body_position_from_low >= (curr_range * 0.5)):
-            return "HAMMER / PIN BAR (BULLISH)"
-
-        # ── SHOOTING STAR / BEARISH PIN BAR ───────────────────────────
-        # Ekor atas panjang >= 2x body, body kecil di 1/3 bawah candle
-        body_position_from_high = curr_high - curr_body_high  # = upper_wick
-        if (upper_wick >= 2.0 * curr_body
-                and body_position_from_high >= (curr_range * 0.5)):
-            return "SHOOTING STAR / PIN BAR (BEARISH)"
-
-    except Exception:
-        return "NEUTRAL"
-
-    return "NEUTRAL"
-
-
-# ----------------------------------------------------------------
-# FUNGSI BARU v9.0: Synthetic DXY Strength
-# ----------------------------------------------------------------
-def get_synthetic_dxy_trend(num_candles: int = 20) -> str:
-    """
-    Menghitung arah USD Dollar Index secara sintetis dari 4 pair korelatif.
-    Menggunakan hanya 20 candle M15 agar proses seringan mungkin.
-
-    Logika:
-    - Jika EMA5 Close > EMA20 Close  → pair itu Uptrend
-    - EURUSD/GBPUSD Uptrend → USD LEMAH (bearish untuk DXY)
-    - USDJPY/USDCHF Uptrend → USD KUAT (bullish untuk DXY)
-
-    Returns:
-        str: "STRONG" (USD strength), "WEAK", atau "NEUTRAL"
-    """
-    # Pair correlated dan bobot arahnya terhadap kekuatan USD
-    # True  = jika pair uptrend, berarti USD KUAT
-    # False = jika pair uptrend, berarti USD LEMAH
-    DXY_PAIRS = [
-        ("EURUSD", False),
-        ("GBPUSD", False),
-        ("USDJPY", True),
-        ("USDCHF", True),
-    ]
-
-    bullish_usd_votes = 0
-    valid_pairs = 0
-
-    for pair_symbol, usd_bullish_when_up in DXY_PAIRS:
+def fetch_ohlcv(
+    kode_saham: str,
+    interval: str = config.YFINANCE_INTERVAL,
+    period: str = config.YFINANCE_PERIOD,
+    max_retry: int = 3,
+) -> Optional[pd.DataFrame]:
+    ticker = format_ticker(kode_saham)
+    for attempt in range(1, max_retry + 1):
         try:
-            # Penarikan data minimalis: hanya 20 candle M15, kolom close saja
-            rates = mt5.copy_rates_from_pos(pair_symbol, mt5.TIMEFRAME_M15, 0, num_candles)
-            if rates is None or len(rates) < num_candles:
-                continue  # Pair tidak tersedia / data kurang
-
-            closes = pd.Series([r['close'] for r in rates], dtype=float)
-            ema5  = closes.ewm(span=5,  adjust=False).mean().iloc[-1]
-            ema20 = closes.ewm(span=20, adjust=False).mean().iloc[-1]
-
-            is_uptrend = ema5 > ema20
-            valid_pairs += 1
-
-            if (is_uptrend and usd_bullish_when_up) or (not is_uptrend and not usd_bullish_when_up):
-                bullish_usd_votes += 1
-
-        except Exception as e:
-            logger.debug(f"[DXY] Gagal tarik data {pair_symbol}: {e}")
-            continue
-
-    if valid_pairs == 0:
-        return "UNKNOWN"
-
-    ratio = bullish_usd_votes / valid_pairs
-    if ratio >= 0.75:
-        return "STRONG"    # 3 atau 4 dari 4 pair konfirmasi USD menguat
-    elif ratio <= 0.25:
-        return "WEAK"      # 3 atau 4 dari 4 pair konfirmasi USD melemah
-    else:
-        return "NEUTRAL"   # Mixed signal
-
-
-# ----------------------------------------------------------------
-# FUNGSI BARU v9.0: Fair Value Gap (FVG) Detector
-# ----------------------------------------------------------------
-def detect_fvg(df: pd.DataFrame, num_candles: int = 15) -> dict:
-    """
-    Mendeteksi Fair Value Gap (FVG) dari N candle terakhir pada sebuah DataFrame.
-    FVG adalah 'jejak kaki' Smart Money berupa celah harga yang belum terisi.
-
-    Logika:
-    - Bearish FVG: High candle[i] < Low candle[i-2]  → gap bearish di atas harga
-    - Bullish FVG: Low candle[i]  > High candle[i-2] → gap bullish di bawah harga
-
-    Hanya FVG terdekat dan belum 'dimitigasi' (harga belum kembali menutupnya)
-    yang dilaporkan—inilah zona paling magnetis bagi harga.
-    """
-    result = {
-        "fvg_bearish_unmitigated": False,
-        "fvg_bearish_zone": None,
-        "fvg_bullish_unmitigated": False,
-        "fvg_bullish_zone": None,
-    }
-
-    if df is None or len(df) < 3:
-        return result
-
-    try:
-        # Scan hanya N candle terbaru untuk kecepatan
-        subset = df.tail(num_candles).reset_index(drop=True)
-        current_price = subset['close'].iloc[-1]
-        latest_bearish_fvg = None
-        latest_bullish_fvg = None
-
-        for i in range(2, len(subset)):
-            h_i   = subset['high'].iloc[i]
-            l_i   = subset['low'].iloc[i]
-            h_i2  = subset['high'].iloc[i - 2]
-            l_i2  = subset['low'].iloc[i - 2]
-
-            # Bearish FVG: candle ke-3 seluruhnya di bawah candle ke-1
-            if h_i < l_i2:
-                zone_top = l_i2   # Batas bawah candle ke-1
-                zone_bot = h_i    # Batas atas candle ke-3
-                # Unmitigated jika harga saat ini BELUM menyentuh zona gap
-                if current_price > zone_top:
-                    latest_bearish_fvg = (zone_top, zone_bot)
-
-            # Bullish FVG: candle ke-3 seluruhnya di atas candle ke-1
-            if l_i > h_i2:
-                zone_top = l_i    # Batas bawah candle ke-3
-                zone_bot = h_i2   # Batas atas candle ke-1
-                # Unmitigated jika harga saat ini BELUM menyentuh zona gap
-                if current_price < zone_top:
-                    latest_bullish_fvg = (zone_top, zone_bot)
-
-        if latest_bearish_fvg:
-            result["fvg_bearish_unmitigated"] = True
-            result["fvg_bearish_zone"] = f"{round(latest_bearish_fvg[0], 5)} - {round(latest_bearish_fvg[1], 5)}"
-
-        if latest_bullish_fvg:
-            result["fvg_bullish_unmitigated"] = True
-            result["fvg_bullish_zone"] = f"{round(latest_bullish_fvg[0], 5)} - {round(latest_bullish_fvg[1], 5)}"
-
-    except Exception as e:
-        logger.debug(f"[FVG] Error deteksi FVG: {e}")
-
-    return result
-
-
-# ----------------------------------------------------------------
-# FUNGSI BARU v9.0: Order Block (OB) Detector — Bonus Weapon
-# ----------------------------------------------------------------
-def detect_order_block(df: pd.DataFrame) -> dict:
-    """
-    Mendeteksi Order Block (OB) — zona konsolidasi institusi sebelum impulse kuat.
-    Logika:
-    - Bullish OB: Candle bearish (merah) besar, langsung disusul oleh kenaikan impulse.
-      Harga sering kembali ke body candle merah ini sebelum rally lebih jauh.
-    - Bearish OB: Candle bullish (hijau) besar, langsung disusul oleh penurunan impulse.
-    Scan 10 candle terakhir. Hanya cari OB yang masih 'di zona' (belum dilewati).
-    """
-    result = {
-        "ob_bullish_zone": None,
-        "ob_bearish_zone": None,
-    }
-
-    if df is None or len(df) < 5:
-        return result
-
-    try:
-        subset = df.tail(10).reset_index(drop=True)
-        current_price = subset['close'].iloc[-1]
-
-        for i in range(1, len(subset) - 1):
-            o, c, h, l = (subset['open'].iloc[i], subset['close'].iloc[i],
-                          subset['high'].iloc[i], subset['low'].iloc[i])
-            body = abs(c - o)
-
-            # Ambang batas: body candle harus cukup signifikan
-            avg_body = abs(subset['close'] - subset['open']).mean()
-            if body < avg_body * 1.2:
+            logger.info(f"[FETCHER] Mengambil data {ticker} interval={interval} (percobaan {attempt})")
+            df = yf.download(ticker, interval=interval, period=period,
+                             progress=False, auto_adjust=True)
+            if df is None or df.empty:
+                if attempt < max_retry:
+                    time.sleep(2 ** attempt)
                 continue
-
-            next_close = subset['close'].iloc[i + 1]
-
-            # Bullish OB: candle BEARISH disusul candle bullish (next > open OB)
-            if c < o and next_close > o:
-                ob_top = o   # atas body candle bearish
-                ob_bot = c   # bawah body candle bearish
-                if current_price > ob_bot:   # Belum terlewati ke bawah
-                    result["ob_bullish_zone"] = f"{round(ob_bot, 5)} - {round(ob_top, 5)}"
-
-            # Bearish OB: candle BULLISH disusul candle bearish (next < open OB)
-            if c > o and next_close < o:
-                ob_top = c   # atas body candle bullish
-                ob_bot = o   # bawah body candle bullish
-                if current_price < ob_top:   # Belum terlewati ke atas
-                    result["ob_bearish_zone"] = f"{round(ob_bot, 5)} - {round(ob_top, 5)}"
-
-    except Exception as e:
-        logger.debug(f"[OB] Error deteksi Order Block: {e}")
-
-    return result
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+            logger.info(f"[FETCHER] ✅ {len(df)} candle untuk {ticker}")
+            return df
+        except Exception as e:
+            logger.error(f"[FETCHER] Error percobaan {attempt}: {e}")
+            if attempt < max_retry:
+                time.sleep(2 ** attempt)
+    return None
 
 
-def get_mt5_data(symbol: str, timeframe: int, num_candles: int = 100) -> pd.DataFrame:
+def fetch_daily(kode_saham: str) -> Optional[pd.DataFrame]:
+    """Ambil data harian (60 hari) untuk multi-timeframe analysis."""
+    return fetch_ohlcv(kode_saham, interval="1d", period="60d")
+
+
+def fetch_info(kode_saham: str) -> dict:
+    ticker = format_ticker(kode_saham)
+    try:
+        info = yf.Ticker(ticker).info
+        return {
+            "nama_perusahaan": info.get("longName", get_clean_code(ticker)),
+            "sektor": info.get("sector", "N/A"),
+        }
+    except Exception:
+        return {"nama_perusahaan": get_clean_code(ticker), "sektor": "N/A"}
+
+
+# ----------------------------------------------------------------
+# KALKULASI INDIKATOR (15 MENIT)
+# ----------------------------------------------------------------
+def calculate_indicators(df: pd.DataFrame) -> Optional[pd.DataFrame]:
     """
-    Mengambil data historical (OHLCV) langung dari MT5 terminal yang terhubung.
-    Operasi ini thread-safe secara natural pada level C API python-MT5 untuk READ.
-    
-    Args:
-        symbol (str): Nama pair atau instrumen, misal 'EURUSD', 'XAUUSDm'.
-        timeframe (int): Konstan dari mt5, misal mt5.TIMEFRAME_H1.
-        num_candles (int): Jumlah bar/candle ke belakang.
-        
-    Returns:
-        pd.DataFrame: DataFrame berisi Open, High, Low, Close, Tick Volume, 
-                      atau empty DataFrame jika gagal.
+    Hitung semua indikator teknikal pada data 15 menit:
+    EMA5, EMA13, RSI14, Volume SMA20, ATR14, Bollinger Bands(20,2)
     """
     try:
-        # Menarik data dari candle yang baru tutup / berjalan (start_pos = 0)
-        rates = mt5.copy_rates_from_pos(symbol, timeframe, 0, num_candles)
-        
-        if rates is None or len(rates) == 0:
-            logger.error(f"[MT5] Tidak dapat mengambil data rates untuk {symbol} pada timeframe {timeframe}.")
-            return pd.DataFrame()
-            
-        # Konversi array of tuples (records) ke Pandas DataFrame
-        df = pd.DataFrame(rates)
-        
-        # Ekstrak waktu dan konversi (Unix seconds to datetime timezone-aware)
-        df['time'] = pd.to_datetime(df['time'], unit='s', utc=True)
+        min_rows = max(config.EMA_SLOW, config.RSI_PERIOD, config.VOLUME_SMA, 20) * 2
+        if len(df) < min_rows:
+            logger.warning(f"[INDICATOR] Data tidak cukup: {len(df)} baris")
+            return None
 
-        # Memastikan kolom-kolom yang diminta saja yang kita pakai untuk efisiensi
-        if 'tick_volume' not in df.columns and 'real_volume' in df.columns:
-            df.rename(columns={'real_volume': 'tick_volume'}, inplace=True)
+        df = df.copy()
+        df.columns = [c.lower() for c in df.columns]
+        close = df["close"]
+        high = df["high"]
+        low = df["low"]
+        vol = df["volume"]
 
-        # Return mapping Open, High, Low, Close, Tick Volume sesuai requirements
-        df = df[['time', 'open', 'high', 'low', 'close', 'tick_volume']]
-        
-        # Pastikan data diurutkan dari terlama ke terbaru
-        df.sort_values(by='time', inplace=True)
-        df.reset_index(drop=True, inplace=True)
-        
+        # --- EMA ---
+        df[f"EMA_{config.EMA_FAST}"] = ta.trend.EMAIndicator(close, config.EMA_FAST, fillna=False).ema_indicator()
+        df[f"EMA_{config.EMA_SLOW}"] = ta.trend.EMAIndicator(close, config.EMA_SLOW, fillna=False).ema_indicator()
+
+        # --- RSI ---
+        df[f"RSI_{config.RSI_PERIOD}"] = ta.momentum.RSIIndicator(close, config.RSI_PERIOD, fillna=False).rsi()
+
+        # --- Volume SMA ---
+        df[f"VOL_SMA_{config.VOLUME_SMA}"] = vol.rolling(config.VOLUME_SMA).mean()
+
+        # --- ATR-14 (untuk Stop Loss) ---
+        df["ATR_14"] = ta.volatility.AverageTrueRange(
+            high=high, low=low, close=close, window=14, fillna=False
+        ).average_true_range()
+
+        # --- Bollinger Bands (20, 2) ---
+        bb = ta.volatility.BollingerBands(close=close, window=20, window_dev=2, fillna=False)
+        df["BB_upper"] = bb.bollinger_hband()
+        df["BB_lower"] = bb.bollinger_lband()
+        df["BB_mid"] = bb.bollinger_mavg()
+        df["BB_width"] = (df["BB_upper"] - df["BB_lower"]) / df["BB_mid"]
+
+        df.dropna(inplace=True)
+        if df.empty:
+            return None
+
+        logger.info(f"[INDICATOR] ✅ {len(df)} candle valid dengan semua indikator")
         return df
 
     except Exception as e:
-        logger.error(f"[MT5] Exception saat mengambil data {symbol}: {e}")
-        return pd.DataFrame()
+        logger.error(f"[INDICATOR] Error: {e}")
+        return None
 
 
 # ----------------------------------------------------------------
-# FUNGSI UTAMA 2: Analisis Kuantitatif Triple Screen
+# MULTI-TIMEFRAME: CEK TREN DAILY
 # ----------------------------------------------------------------
-def analyze_triple_screen(symbol: str) -> dict:
+def get_daily_trend(kode_saham: str) -> dict:
     """
-    Otak Kuantitatif: Menerapkan Alexander Elder's Triple Screen System
-    + VWAP Harian HFT Style + Volume Surge + Risk Management Dinamis.
-    
-    Args:
-        symbol (str): Instrumen trading MT5.
-        
-    Returns:
-        dict: Eksekutif summary dari layar-layar analisis beserta risk-reward, 
-              (kosong / dict default jika gagal).
+    Ambil data harian dan hitung EMA-20 Daily.
+    Return: apakah harga saat ini berada di atas EMA-20 Daily (uptrend).
     """
-    logger.info(f"[TRIPLE SCREEN] Memulai analisis untuk {symbol}")
-    
-    # Init default failed result
-    failed_result = {
-        "symbol": symbol,
-        "valid": False,
-        "error": "Gagal fetch data / data tidak mencukupi"
-    }
+    df_daily = fetch_daily(kode_saham)
+    default = {"uptrend_daily": False, "harga_vs_ema20d": 0.0, "ema20_daily": 0.0}
 
-    # Tarik 3 Timeframe (H1, M15, M1) masing-masing 100 candle
-    # Untuk H1 di-pull 250 agar EMA 200 bisa dikalkulasikan dengan valid.
-    df_h1 = get_mt5_data(symbol, mt5.TIMEFRAME_H1, 250) 
-    df_m15 = get_mt5_data(symbol, mt5.TIMEFRAME_M15, 100)
-    df_m1 = get_mt5_data(symbol, mt5.TIMEFRAME_M1, 100)
-    
-    if df_h1.empty or df_m15.empty or df_m1.empty:
-        return failed_result
+    if df_daily is None or df_daily.empty or len(df_daily) < 25:
+        return default
 
     try:
-        current_price = df_m1['close'].iloc[-1]
-        
-        # ==========================================================
-        # LAYER 1 (H1) - MACRO TREND (Arah Arus Utama)
-        # ==========================================================
-        df_h1['EMA_50'] = ta.trend.ema_indicator(df_h1['close'], window=50, fillna=False)
-        df_h1['EMA_200'] = ta.trend.ema_indicator(df_h1['close'], window=200, fillna=False)
-        
-        last_h1 = df_h1.iloc[-1]
-        c_h1 = last_h1['close']
-        ema50_h1 = last_h1['EMA_50']
-        ema200_h1 = last_h1['EMA_200']
-        
-        trend = "SIDEWAYS"
-        if pd.notna(ema50_h1) and pd.notna(ema200_h1):
-            if c_h1 > ema50_h1 and ema50_h1 > ema200_h1:
-                trend = "BULLISH"
-            elif c_h1 < ema50_h1 and ema50_h1 < ema200_h1:
-                trend = "BEARISH"
+        if isinstance(df_daily.columns, pd.MultiIndex):
+            df_daily.columns = df_daily.columns.get_level_values(0)
+        df_daily.columns = [c.lower() for c in df_daily.columns]
 
-        # [v9.0] Synthetic DXY Strength — cek apakah ada konflik makro
-        dxy_trend = get_synthetic_dxy_trend(num_candles=20)
-        is_gold = any(kw in symbol.upper() for kw in ["XAU", "GOLD"])
-        dxy_conflict = is_gold and dxy_trend == "STRONG"
-        if dxy_conflict:
-            logger.warning(f"[v9.0] DXY CONFLICT aktif! DXY={dxy_trend}, {symbol} adalah Emas → BUY DIBLOKIR oleh Makro!")
+        close_daily = df_daily["close"]
+        ema20d = ta.trend.EMAIndicator(close_daily, window=20, fillna=False).ema_indicator().dropna()
 
-        # ==========================================================
-        # LAYER 2 (M15) - MOMENTUM & VWAP (Diskon Harga)
-        # ==========================================================
-        df_m15['RSI_14'] = ta.momentum.rsi(df_m15['close'], window=14, fillna=False)
-        last_rsi_14 = df_m15['RSI_14'].iloc[-1]
-        
-        # VWAP Harian (Intraday VWAP)
-        df_m15['date'] = df_m15['time'].dt.date
-        df_m15['typical_price'] = (df_m15['high'] + df_m15['low'] + df_m15['close']) / 3
-        df_m15['vol_x_typ'] = df_m15['typical_price'] * df_m15['tick_volume']
-        
-        groupby_date = df_m15.groupby('date')
-        df_m15['cum_vol_typ'] = groupby_date['vol_x_typ'].cumsum()
-        df_m15['cum_vol'] = groupby_date['tick_volume'].cumsum()
-        df_m15['VWAP'] = df_m15['cum_vol_typ'] / df_m15['cum_vol']
-        
-        last_m15 = df_m15.iloc[-1]
-        c_m15 = last_m15['close']
-        vwap_m15 = last_m15['VWAP']
-        # Jarak persentase harga Close M15 saat ini terhadap VWAP
-        vwap_distance_pct = ((c_m15 - vwap_m15) / vwap_m15) * 100 if vwap_m15 else 0
-        
-        vwap_status = "DISCOUNT (Below VWAP)" if c_m15 < vwap_m15 else "PREMIUM (Above VWAP)"
+        if ema20d.empty:
+            return default
 
-        # ==========================================================
-        # SUPPORT & RESISTANCE M15 (Donchian Channel 50 Candle)
-        # ==========================================================
-        # Menggunakan 50 candle terakhir (tidak termasuk candle terkini)
-        lookback = min(50, len(df_m15) - 1)
-        resistance_m15 = float(df_m15['high'].iloc[-lookback-1:-1].max())
-        support_m15    = float(df_m15['low'].iloc[-lookback-1:-1].min())
-        
-        pip_multiplier_sr = get_pip_multiplier(symbol)
-        dist_to_resistance_pips = (resistance_m15 - c_m15) * pip_multiplier_sr
-        dist_to_support_pips    = (c_m15 - support_m15) * pip_multiplier_sr
-        
-        # Status posisi harga terhadap S/R
-        s_r_zone_pct = 0.05  # Dalam 5% dari range = zona S/R
-        sr_range = resistance_m15 - support_m15
-        sr_status = "MID RANGE"
-        if sr_range > 0:
-            if (c_m15 - support_m15) / sr_range <= s_r_zone_pct:
-                sr_status = "AT SUPPORT (Potential Bounce)"
-            elif (resistance_m15 - c_m15) / sr_range <= s_r_zone_pct:
-                sr_status = "AT RESISTANCE (Potential Rejection)"
+        harga_terakhir = float(close_daily.iloc[-1])
+        nilai_ema20d = float(ema20d.iloc[-1])
+        uptrend = harga_terakhir > nilai_ema20d
+        selisih_pct = ((harga_terakhir - nilai_ema20d) / nilai_ema20d) * 100
 
-        # Deteksi Price Action di M15
-        pa_m15 = detect_candlestick_pattern(df_m15)
-
-        # [v9.0] Smart Money Concepts: FVG + Order Block
-        fvg_data = detect_fvg(df_m15, num_candles=15)
-        ob_data  = detect_order_block(df_m15)
-        smart_money = {**fvg_data, **ob_data}
-
-        # ==========================================================
-        # LAYER 3 (M1) - EXECUTION TRIGGER (Pelatuk Entri)
-        # ==========================================================
-        last_m1 = df_m1.iloc[-1]
-        current_m1_vol = last_m1['tick_volume']
-        
-        # Rata-rata 10 candle terakhir sebelum candle terkini
-        avg_vol_10 = df_m1['tick_volume'].iloc[-11:-1].mean() if len(df_m1) > 10 else df_m1['tick_volume'].mean()
-        
-        # Deteksi *Volume Surge*
-        is_volume_surge = current_m1_vol > (2.5 * avg_vol_10) if avg_vol_10 > 0 else False
-        
-        # ATR(14)
-        df_m1['ATR_14'] = ta.volatility.average_true_range(
-            high=df_m1['high'],
-            low=df_m1['low'],
-            close=df_m1['close'],
-            window=14,
-            fillna=False
-        )
-        last_atr_14 = df_m1['ATR_14'].iloc[-1]
-
-        # Deteksi Price Action di M1
-        pa_m1 = detect_candlestick_pattern(df_m1)
-        
-        # ==========================================================
-        # KALKULASI PIPS & RISK/REWARD (1:1.5)
-        # ==========================================================
-        pip_multiplier = get_pip_multiplier(symbol)
-        
-        ATR_MULTIPLIER = 2.5
-        base_atr = last_atr_14 if pd.notna(last_atr_14) else (current_price * 0.001)
-        sl_raw_distance = base_atr * ATR_MULTIPLIER
-        
-        # Perhitungan matematis risk di hitung sebagai pips
-        sl_pips = sl_raw_distance * pip_multiplier
-        tp_pips = sl_pips * 1.5
-        
-        # Hitung Kedua Skenario (Long & Short)
-        long_sl = current_price - sl_raw_distance
-        long_tp = current_price + (sl_raw_distance * 1.5)
-        
-        short_sl = current_price + sl_raw_distance
-        short_tp = current_price - (sl_raw_distance * 1.5)
-            
-        # ==========================================================
-        # RANGKUMAN (DICTIONARY UNTUK LLM)
-        # ==========================================================
-        executive_summary = {
-            "symbol": symbol,
-            "valid": True,
-            "current_price": round(current_price, 5),
-            "macro_h1": {
-                "trend": trend,
-                "close": round(c_h1, 5),
-                "ema_50": round(ema50_h1, 5) if pd.notna(ema50_h1) else None,
-                "ema_200": round(ema200_h1, 5) if pd.notna(ema200_h1) else None,
-                "dxy_trend": dxy_trend,
-                "dxy_conflict": dxy_conflict
-            },
-            "momentum_m15": {
-                "rsi_14": round(last_rsi_14, 2) if pd.notna(last_rsi_14) else None,
-                "vwap_daily": round(vwap_m15, 5) if pd.notna(vwap_m15) else None,
-                "vwap_status": vwap_status,
-                "vwap_distance_pct": round(vwap_distance_pct, 4),
-                "price_action": pa_m15,
-                "support_m15": round(support_m15, 5),
-                "resistance_m15": round(resistance_m15, 5),
-                "dist_to_support_pips": round(dist_to_support_pips, 1),
-                "dist_to_resistance_pips": round(dist_to_resistance_pips, 1),
-                "sr_status": sr_status,
-                "smart_money": smart_money
-            },
-            "execution_m1": {
-                "volume_surge_detected": bool(is_volume_surge),
-                "current_tick_volume": int(current_m1_vol),
-                "average_tick_volume_10": round(avg_vol_10, 2),
-                "atr_14": round(last_atr_14, 6) if pd.notna(last_atr_14) else None,
-                "price_action": pa_m1
-            },
-            "risk_management": {
-                "raw_atr_distance_pips": round(sl_pips, 2),
-                "scenario_long": {
-                    "entry": round(current_price, 5),
-                    "sl": round(long_sl, 5),
-                    "tp": round(long_tp, 5)
-                },
-                "scenario_short": {
-                    "entry": round(current_price, 5),
-                    "sl": round(short_sl, 5),
-                    "tp": round(short_tp, 5)
-                }
-            }
+        logger.info(f"[MTF] Daily trend: harga={harga_terakhir:.5f} EMA20d={nilai_ema20d:.5f} uptrend={uptrend}")
+        return {
+            "uptrend_daily": uptrend,
+            "harga_vs_ema20d": round(selisih_pct, 2),
+            "ema20_daily": round(nilai_ema20d, 2),
         }
-        
-        logger.info(
-            f"[TRIPLE SCREEN] Analisis sukses untuk {symbol}. "
-            f"Trend: {trend} | DXY: {dxy_trend} | Conflict: {dxy_conflict} | "
-            f"FVG Bear: {fvg_data['fvg_bearish_unmitigated']} | FVG Bull: {fvg_data['fvg_bullish_unmitigated']} | "
-            f"Vol Surge: {is_volume_surge}"
-        )
-        return executive_summary
-        
+
     except Exception as e:
-        logger.error(f"[TRIPLE SCREEN] Runtime error kalkulasi untuk {symbol}: {e}")
-        return failed_result
+        logger.warning(f"[MTF] Error daily trend: {e}")
+        return default
+
+
+# ----------------------------------------------------------------
+# DETEKSI SINYAL
+# ----------------------------------------------------------------
+def detect_signal(df: pd.DataFrame) -> dict:
+    """Deteksi semua kondisi sinyal dari candle terakhir."""
+    col_ef = f"EMA_{config.EMA_FAST}"
+    col_es = f"EMA_{config.EMA_SLOW}"
+    col_rsi = f"RSI_{config.RSI_PERIOD}"
+    col_vsma = f"VOL_SMA_{config.VOLUME_SMA}"
+
+    row_prev = df.iloc[-2]
+    row_last = df.iloc[-1]
+
+    # EMA Crossover
+    ema_was_below = row_prev[col_ef] < row_prev[col_es]
+    ema_now_above = row_last[col_ef] > row_last[col_es]
+    is_crossover = ema_was_below and ema_now_above
+    ema_bullish = row_last[col_ef] > row_last[col_es]  # EMA fast masih di atas
+
+    # Volume
+    vol_current = float(row_last["volume"])
+    vol_sma = float(row_last[col_vsma]) if col_vsma in df.columns else 1
+    vol_ratio = vol_current / vol_sma if vol_sma > 0 else 0
+    is_vol_surge = vol_ratio >= config.VOLUME_SURGE_MULTIPLIER
+
+    # RSI
+    rsi_val = float(row_last[col_rsi])
+    is_rsi_safe = rsi_val < config.RSI_OVERBOUGHT
+
+    # Bollinger Bands Squeeze + Breakout
+    bb_squeeze = False
+    bb_breakout = False
+    bb_width_now = float(row_last.get("BB_width", 0))
+    bb_upper = float(row_last.get("BB_upper", 0))
+    close_now = float(row_last["close"])
+
+    if "BB_width" in df.columns and len(df) >= 20:
+        bb_width_hist = df["BB_width"].tail(20)
+        bb_percentile_20 = float(bb_width_hist.quantile(0.25))
+        bb_squeeze = bb_width_now < bb_percentile_20
+        bb_breakout = (close_now > bb_upper) and is_vol_surge and bb_squeeze
+
+    # Sinyal utama valid jika SEMUA 3 kondisi dasar terpenuhi
+    is_valid = is_crossover and is_vol_surge and is_rsi_safe
+
+    return {
+        "sinyal_valid": is_valid,
+        "harga_terakhir": round(close_now, 5),
+        "kondisi": {
+            "crossover": {
+                "status": is_crossover,
+                "ema_bullish": ema_bullish,
+                "ema_fast_sebelum": round(float(row_prev[col_ef]), 5),
+                "ema_slow_sebelum": round(float(row_prev[col_es]), 5),
+                "ema_fast_sekarang": round(float(row_last[col_ef]), 5),
+                "ema_slow_sekarang": round(float(row_last[col_es]), 5),
+            },
+            "volume": {
+                "status": is_vol_surge,
+                "volume_sekarang": int(vol_current),
+                "volume_sma": round(float(vol_sma), 0),
+                "rasio": round(vol_ratio, 2),
+            },
+            "rsi": {
+                "status": is_rsi_safe,
+                "nilai": round(rsi_val, 2),
+                "batas_overbought": config.RSI_OVERBOUGHT,
+            },
+            "bollinger": {
+                "squeeze": bb_squeeze,
+                "breakout": bb_breakout,
+                "bb_width": round(bb_width_now, 4),
+                "bb_upper": round(bb_upper, 2),
+            },
+        },
+    }
+
+
+# ----------------------------------------------------------------
+# ATR STOP LOSS & TARGET & LOT CALCULATION (v7.0)
+# ----------------------------------------------------------------
+def calculate_lot_size(equity: float, risk_pct: float, sl_pips: float, ticker: str) -> float:
+    """
+    Hitung Lot Size agar risiko tetap (Risk Management).
+    Formula: RiskAmount / (SL_Pips * PipValue_per_standard_lot)
+    Standard Lot = 100,000 units.
+    Pip Value per Standard Lot (untuk XXX/USD) = $10.
+    """
+    if sl_pips <= 0:
+        return 0.01
+        
+    risk_amount = equity * (risk_pct / 100)
+    
+    # Estimasi Pip Value (Standard Lot 100k)
+    # Untuk XXX/USD = $10. Untuk JPY pairs = variable tapi bisa di-proxied $10.
+    pip_value_std = 10.0 
+    
+    # Lot = Risk / (SL * PipValue)
+    lot = risk_amount / (sl_pips * pip_value_std)
+    
+    # Pembulatan di Forex biasanya 0.01 (Micro Lot)
+    return max(0.01, round(lot, 2))
+
+def calculate_risk_management(df: pd.DataFrame, harga: float, ticker: str = "EURUSD=X") -> dict:
+    """
+    Hitung Stop Loss dinamis berdasarkan ATR dan Target Price.
+    Stop Loss = harga - (ATR_MULTIPLIER × ATR)
+    Target    = harga + (ATR_MULTIPLIER × ATR × RISK_REWARD)
+    """
+    try:
+        col_atr = f"ATR_{config.ATR_PERIOD}"
+        atr = float(df[col_atr].iloc[-1]) if col_atr in df.columns else float(df.filter(like='ATR').iloc[-1])
+        
+        stop_loss = harga - (config.ATR_MULTIPLIER * atr)
+        target = harga + (config.ATR_MULTIPLIER * atr * config.RISK_REWARD_RATIO)
+        
+        # Hitung jarak dalam Pip
+        multiplier = get_pip_multiplier(ticker)
+        
+        risiko_pips = abs(harga - stop_loss) * multiplier
+        potensi_pips = abs(target - harga) * multiplier
+        
+        rr = round(potensi_pips / risiko_pips, 2) if risiko_pips > 0 else 0
+        
+        # v7.0 Position Sizing
+        recommended_lot = calculate_lot_size(
+            config.DEFAULT_EQUITY, 
+            config.RISK_PER_TRADE_PCT, 
+            risiko_pips, 
+            ticker
+        )
+        
+        return {
+            "atr": round(atr, 6),
+            "stop_loss": round(stop_loss, 5),
+            "target_price": round(target, 5),
+            "stop_pips": round(risiko_pips, 1),
+            "target_pips": round(potensi_pips, 1),
+            "risk_reward": rr,
+            "recommended_lot": recommended_lot
+        }
+    except Exception as e:
+        logger.warning(f"[RISK] Error kalkulasi risk management: {e}")
+        return {
+            "atr": 0, "stop_loss": harga, "target_price": harga,
+            "stop_pips": 0, "target_pips": 0, "risk_reward": 0, "recommended_lot": 0.01
+        }
+
+
+# ----------------------------------------------------------------
+# TECHNICAL SCORING (0-100)
+# ----------------------------------------------------------------
+def calculate_technical_score(sinyal: dict, daily_trend: dict) -> int:
+    """
+    Sistem scoring teknikal 0-100 berdasarkan semua kondisi.
+    Digunakan untuk menentukan rekomendasi BUY / SELL / HOLD.
+    """
+    score = 0
+    k = sinyal["kondisi"]
+
+    # EMA Crossover (25 poin)
+    if k["crossover"]["status"]:
+        score += 25  # Crossover baru terjadi
+    elif k["crossover"]["ema_bullish"]:
+        score += 12  # EMA fast masih di atas (tren berlanjut)
+
+    # Volume (20 poin)
+    vol_rasio = k["volume"]["rasio"]
+    if vol_rasio >= 3.0:
+        score += 20
+    elif vol_rasio >= 2.0:
+        score += 15
+    elif vol_rasio >= 1.2:
+        score += 8
+
+    # RSI (20 poin)
+    rsi = k["rsi"]["nilai"]
+    if 40 <= rsi <= 60:
+        score += 20   # RSI zona netral terbaik
+    elif 30 <= rsi < 40:
+        score += 15   # Mendekati oversold, peluang rebound
+    elif 60 < rsi <= 70:
+        score += 10   # Masih aman tapi mulai panas
+    elif rsi < 30:
+        score += 18   # Oversold kuat, potensi reversal
+
+    # Bollinger Bands Breakout (20 poin)
+    if k["bollinger"]["breakout"]:
+        score += 20   # Breakout dari squeeze = sinyal A++
+    elif k["bollinger"]["squeeze"]:
+        score += 10   # Squeeze saja = energi terkumpul, siap meledak
+
+    # Multi-Timeframe Konfirmasi Daily (15 poin)
+    if daily_trend["uptrend_daily"]:
+        score += 15   # Tren utama naik = sinyal lebih valid
+
+    return min(score, 100)
+
+
+# ----------------------------------------------------------------
+# PIVOT POINT
+# ----------------------------------------------------------------
+def calculate_pivot_points(df: pd.DataFrame) -> dict:
+    try:
+        df_work = df.copy()
+        if not isinstance(df_work.index, pd.DatetimeIndex):
+            df_work = df_work.set_index(pd.to_datetime(df_work.index))
+        df_daily = df_work.resample("D").agg({"high": "max", "low": "min", "close": "last"}).dropna()
+        prev = df_daily.iloc[-2] if len(df_daily) >= 2 else df_work.iloc[-2]
+        h, l, c = float(prev["high"]), float(prev["low"]), float(prev["close"])
+        pp = (h + l + c) / 3
+        return {
+            "PP": round(pp, 5),
+            "R1": round((2 * pp) - l, 5),
+            "R2": round(pp + (h - l), 5),
+            "S1": round((2 * pp) - h, 5),
+            "S2": round(pp - (h - l), 5),
+        }
+    except Exception as e:
+        logger.warning(f"[PIVOT] Error: {e}")
+        return {"PP": 0, "R1": 0, "R2": 0, "S1": 0, "S2": 0}
+
+
+# ----------------------------------------------------------------
+# FULL SCREENING (main function)
+# ----------------------------------------------------------------
+def full_screening(kode_saham: str) -> Optional[dict]:
+    """
+    Screening lengkap v2.0:
+    Data 15m + Daily + semua indikator + risk management + scoring
+    """
+    ticker = format_ticker(kode_saham)
+    kode_bersih = get_clean_code(kode_saham)
+
+    # 1. Data 15 menit
+    df = fetch_ohlcv(ticker)
+    if df is None:
+        return None
+
+    # 2. Hitung indikator
+    df = calculate_indicators(df)
+    if df is None:
+        return None
+
+    # 3. Deteksi sinyal
+    sinyal = detect_signal(df)
+    harga = sinyal["harga_terakhir"]
+
+    # 4. Multi-Timeframe (daily trend)
+    daily_trend = get_daily_trend(ticker)
+
+    # 5. Risk Management (ATR-based)
+    risk = calculate_risk_management(df, harga, ticker)
+
+    # 6. Pivot Points
+    pivots = calculate_pivot_points(df)
+
+    # 7. Technical Score
+    tech_score = calculate_technical_score(sinyal, daily_trend)
+
+    # 8. Perubahan harga vs candle sebelumnya
+    harga_prev = float(df.iloc[-2]["close"])
+    perubahan_pct = ((harga - harga_prev) / harga_prev) * 100
+
+    # 9. Info perusahaan
+    info = fetch_info(ticker)
+
+    return {
+        "ticker": ticker,
+        "kode": kode_bersih,
+        "nama_perusahaan": info.get("nama_perusahaan", kode_bersih),
+        "harga_terakhir": harga,
+        "perubahan_pct": round(perubahan_pct, 2),
+        "pivot_points": pivots,
+        "daily_trend": daily_trend,
+        "risk_management": risk,
+        "technical_score": tech_score,
+        "df": df,  # Dibutuhkan untuk generate chart
+        **sinyal,
+    }
+
 
 if __name__ == "__main__":
-    # Test call - Jangan panggil jika tidak terkoneksi ke MT5
-    # Pastikan MetaTrader5 terinisialisasi
-    if not mt5.initialize():
-        print("initialize() failed, error code =", mt5.last_error())
-        quit()
+    logging.basicConfig(level=logging.INFO)
+    hasil = full_screening("BBCA")
+    if hasil:
+        print(f"Saham: {hasil['kode']} | Harga: Rp {hasil['harga_terakhir']:,.0f}")
+        print(f"Score Teknikal: {hasil['technical_score']}/100")
+        print(f"ATR Stop Loss: Rp {hasil['risk_management']['stop_loss']:,.0f}")
+
+
+# ----------------------------------------------------------------
+# BULK DOWNLOAD (v3.0) - Tarik 100 Saham Sekaligus
+# ----------------------------------------------------------------
+def bulk_fetch_ohlcv(kode_list: list[str], interval: str = "15m", period: str = "2d", min_len: int = 2) -> dict:
+    """
+    Download data OHLCV untuk banyak saham SEKALIGUS dalam 1 request yfinance.
+    Jauh lebih cepat daripada looping satu per satu.
+
+    Returns:
+        dict: { 'BBCA': DataFrame, 'TLKM': DataFrame, ... }
+    """
+    tickers = [format_ticker(k) for k in kode_list]
+    tickers_str = " ".join(tickers)
+
+    try:
+        logger.info(f"[BULK] Mengunduh {len(tickers)} saham sekaligus...")
+        raw = yf.download(
+            tickers=tickers_str,
+            interval=interval,
+            period=period,
+            group_by="ticker",
+            progress=False,
+            auto_adjust=True,
+            threads=True,
+        )
+        result = {}
+        for ticker in tickers:
+            kode = get_clean_code(ticker)
+            try:
+                if len(tickers) == 1:
+                    # Single ticker: tidak ada multi-index
+                    df = raw.copy()
+                else:
+                    df = raw[ticker].copy()
+
+                if df is None or df.empty:
+                    continue
+                if isinstance(df.columns, pd.MultiIndex):
+                    df.columns = df.columns.get_level_values(0)
+                df.columns = [c.lower() for c in df.columns]
+                df.dropna(subset=["close", "volume"], inplace=True)
+                if len(df) >= min_len:
+                    result[kode] = df
+            except Exception:
+                continue
+
+        logger.info(f"[BULK] ✅ {len(result)}/{len(tickers)} saham berhasil diunduh")
+        return result
+
+    except Exception as e:
+        logger.error(f"[BULK] Error bulk download: {e}")
+        return {}
+
+
+def quick_scan(kode_saham: str, df: pd.DataFrame) -> dict | None:
+    """
+    Versi ringan dari full_screening — tanpa fetch info, tanpa daily trend.
+    Digunakan untuk scan massal /rekomendasi dan /danger.
+    Input df sudah di-lowercase kolomnya.
+    """
+    try:
+        df_ind = calculate_indicators(df)
+        if df_ind is None or len(df_ind) < 3:
+            return None
+
+        sinyal = detect_signal(df_ind)
+        harga = sinyal["harga_terakhir"]
+
+        # Perubahan harga vs candle pertama hari ini
+        # Ambil close sekitar 27 candle lalu (≈ 1 hari kalau interval 15m)
+        lookback = min(27, len(df_ind) - 1)
+        harga_ref = float(df_ind.iloc[-lookback]["close"])
+        perubahan_pct = ((harga - harga_ref) / harga_ref) * 100 if harga_ref > 0 else 0
+
+        risk = calculate_risk_management(df_ind, harga, kode_saham)
+
+        # Score ringan tanpa daily trend
+        score_ringan = calculate_technical_score(sinyal, {"uptrend_daily": False})
+
+        return {
+            "kode": kode_saham,
+            "harga_terakhir": harga,
+            "perubahan_pct": round(perubahan_pct, 2),
+            "technical_score": score_ringan,
+            "risk_management": risk,
+            "sinyal_valid": sinyal["sinyal_valid"],
+            "kondisi": sinyal["kondisi"],
+        }
+
+    except Exception as e:
+        logger.warning(f"[QUICK_SCAN] Error {kode_saham}: {e}")
+        return None
+
+
+def scan_forex_buy(kode_list: list[str], calendar: list = None) -> list[dict]:
+    """
+    Scan semua instrumen di kode_list untuk mencari kandidat BUY.
+    Filter: technical_score >= config.TECHNICAL_SCORE_BUY
+            AND perubahan_pct dalam range VOLATILITY_MIN - VOLATILITY_MAX
+            AND volume surge
+            AND No Red Folder News (Kill-Switch)
+    """
+    logger.info(f"[REKO] Mulai scan {len(kode_list)} pair untuk kandidat BUY...")
+    data_map = bulk_fetch_ohlcv(kode_list, min_len=10)
+    candidates = []
+
+    for kode, df in data_map.items():
+        result = quick_scan(kode, df)
+        if result is None:
+            continue
+        score = result["technical_score"]
+        pct = result["perubahan_pct"]
+        vol_surge = result["kondisi"]["volume"]["status"]
+
+        # Filter volatilitas sweet spot
+        in_sweet_spot = config.VOLATILITY_MIN_PCT <= pct <= config.VOLATILITY_MAX_PCT
         
-    res = analyze_triple_screen("EURUSD")
-    print("Hasil Analisis:", res)
-    mt5.shutdown()
+        # Check Kill-Switch (Red Folder Filter)
+        killed = False
+        kill_reason = ""
+        if calendar:
+            ticker = format_ticker(kode)
+            # Check both base and quote currency
+            base = ticker[:3]
+            quote = ticker[3:6]
+            
+            kill_base, msg_base = is_kill_switch_active(calendar, base)
+            kill_quote, msg_quote = is_kill_switch_active(calendar, quote)
+            
+            if kill_base or kill_quote:
+                killed = True
+                kill_reason = msg_base or msg_quote
+
+        if score >= config.TECHNICAL_SCORE_BUY and in_sweet_spot and vol_surge and not killed:
+            candidates.append(result)
+        elif killed:
+            logger.warning(f"[REKO] 🛡 {kode} diabaikan: {kill_reason} (Kill-Switch)")
+
+    candidates.sort(key=lambda x: x["technical_score"], reverse=True)
+    logger.info(f"[REKO] ✅ {len(candidates)} kandidat BUY ditemukan")
+    return candidates[:10]  # Top 10
+
+
+def scan_forex_danger(kode_list: list[str]) -> list[dict]:
+    """
+    Scan semua instrumen di kode_list untuk mendeteksi pergerakan BERBAHAYA.
+    Filter: perubahan_pct <= DANGER_DROP_PCT
+            OR (RSI overbought AND volume turun)
+    """
+    logger.info(f"[DANGER] Mulai scan {len(kode_list)} pair untuk deteksi bahaya...")
+    data_map = bulk_fetch_ohlcv(kode_list, min_len=10)
+    dangerous = []
+
+    for kode, df in data_map.items():
+        result = quick_scan(kode, df)
+        if result is None:
+            continue
+        pct = result["perubahan_pct"]
+        rsi = result["kondisi"]["rsi"]["nilai"]
+        score = result["technical_score"]
+
+        # Instrumen dianggap berbahaya jika:
+        # 1. Turun drastis dalam sehari, ATAU
+        # 2. RSI overbought (> 75) dengan score lemah (potensi reversal turun)
+        is_dropping = pct <= config.DANGER_DROP_PCT
+        is_overbought_weak = rsi > 75 and score < 40
+
+        if is_dropping or is_overbought_weak:
+            # Semakin merah semakin atas daftar
+            result["danger_score"] = abs(pct) if is_dropping else rsi / 10
+            result["danger_type"] = "DROP" if is_dropping else "OVERBOUGHT"
+            dangerous.append(result)
+
+    dangerous.sort(key=lambda x: x["danger_score"], reverse=True)
+    logger.info(f"[DANGER] ✅ {len(dangerous)} bahaya terdeteksi")
+    return dangerous[:10]  # Top 10
+
+
+# ----------------------------------------------------------------
+# CURRENCY STRENGTH METER (v7.0 HOLY GRAIL)
+# ----------------------------------------------------------------
+def calculate_csm(all_data: list[dict]) -> dict:
+    """
+    Kalkulasi kekuatan mata uang relatif (8 major currencies).
+    Input: all_data dari get_market_leaders (change_pct harian).
+    """
+    majors = ["USD", "EUR", "GBP", "JPY", "AUD", "NZD", "CAD", "CHF"]
+    strength = {m: {"total": 0.0, "count": 0} for m in majors}
+    
+    for d in all_data:
+        kode = d["kode"]
+        if len(kode) != 6: continue
+        
+        base, quote = kode[:3], kode[3:6]
+        change = d["change_pct"]
+        
+        # Base currency: performance sejalan dengan pair
+        if base in strength:
+            strength[base]["total"] += change
+            strength[base]["count"] += 1
+            
+        # Quote currency: performance berlawanan dengan pair
+        if quote in strength:
+            strength[quote]["total"] -= change
+            strength[quote]["count"] += 1
+            
+    # Hitung rata-rata
+    results = {}
+    for m, val in strength.items():
+        avg = val["total"] / val["count"] if val["count"] > 0 else 0.0
+        results[m] = round(avg, 2)
+        
+    # Sort dari terkuat ke terlemah
+    sorted_csm = dict(sorted(results.items(), key=lambda item: item[1], reverse=True))
+    return sorted_csm
+
+
+def get_market_leaders(kode_list: list[str]) -> dict:
+    """
+    (v4.0) Ambil data market leaders: Top Gainer, Top Volume, Top Value, dan Live Rebound.
+    Hanya butuh data OHLCV dasar, sangat cepat menggunakan bulk_fetch_ohlcv.
+    """
+    logger.info(f"[MARKET] Mengambil data market dari {len(kode_list)} pair...")
+    data_map = bulk_fetch_ohlcv(kode_list, interval="1d", period="2d", min_len=2) # Pakai daily untuk gain hari ini
+    
+    all_data = []
+    
+    for kode, df in data_map.items():
+        try:
+            if len(df) < 2:
+                continue
+            
+            # Hari ini
+            current = df.iloc[-1]
+            close = float(current["close"])
+            open_price = float(current["open"])
+            low = float(current["low"])
+            high = float(current["high"])
+            vol = float(current["volume"])
+            
+            # Kemarin
+            prev = df.iloc[-2]
+            prev_close = float(prev["close"])
+            prev_high = float(prev["high"])
+            prev_low = float(prev["low"])
+            
+            # Kalkulasi Pivot Point standar klasik
+            pp = (prev_high + prev_low + prev_close) / 3
+            s1 = (2 * pp) - prev_high
+            
+            # Metric
+            change_pct = ((close - prev_close) / prev_close) * 100
+            value = close * vol
+            
+            # Rebound logic: sempat turun kena Support 1 tapi ditutup (current) hijau di atas open
+            is_rebound = low <= s1 and close > open_price and change_pct > 0
+            
+            all_data.append({
+                "kode": kode,
+                "harga": close,
+                "change_pct": change_pct,
+                "volume": vol,
+                "value": value,
+                "is_rebound": is_rebound
+            })
+        except Exception:
+            pass
+            
+    if not all_data:
+        return {}
+
+    # Sort data
+    top_gainers = sorted(all_data, key=lambda x: x["change_pct"], reverse=True)[:5]
+    top_volume = sorted(all_data, key=lambda x: x["volume"], reverse=True)[:5]
+    top_value = sorted(all_data, key=lambda x: x["value"], reverse=True)[:5]
+    live_rebound = [d for d in all_data if d["is_rebound"]]
+    # Sort rebound berdasarkan change terkuat
+    live_rebound = sorted(live_rebound, key=lambda x: x["change_pct"], reverse=True)[:5]
+    
+    # v7.0 Generate CSM
+    csm_data = calculate_csm(all_data)
+    
+    logger.info("[MARKET] ✅ Berhasil mendapatkan data market leaders")
+    return {
+        "top_gainer": top_gainers,
+        "top_volume": top_volume,
+        "top_value": top_value,
+        "live_rebound": live_rebound,
+        "csm": csm_data
+    }
+
+
+def get_autoscalping_candidates(kode_list: list[str], force: bool = False, calendar: list = None) -> list[dict]:
+    """
+    (v5.0 & v6.0) Cari 1-3 kandidat TERBAIK secara kuantitatif untuk Auto Scalping.
+    Jika force=True, filter lebih longgar untuk memastikan ada kandidat.
+    """
+    logger.info(f"[AUTOSCALP] Memulai filter kuantitatif scalping dari {len(kode_list)} pair... (Force: {force})")
+    
+    # -- V1.0 FOREX MACRO WEATHER CHECK (DXY Correlation) --
+    is_dxy_rallying = False
+    try:
+        dxy_df = yf.Ticker("DX-Y.NYB").history(period="2d", interval="1h")
+        if len(dxy_df) >= 2:
+            prev_close = dxy_df['Close'].iloc[-2]
+            curr_close = dxy_df['Close'].iloc[-1]
+            dxy_pct = ((curr_close - prev_close) / prev_close) * 100
+            
+            if dxy_pct >= 0.2:
+                is_dxy_rallying = True
+                logger.warning(f"[AUTOSCALP] ⚠️ DXY RALLY (+{dxy_pct:.2f}%): USD menguat tajam, hati-hati pair XXXUSD.")
+            else:
+                logger.info(f"[AUTOSCALP] 🌤 Cuaca DXY Normal ({dxy_pct:.2f}%).")
+    except Exception as e:
+        logger.error(f"[AUTOSCALP] Gagal cek DXY: {e}")
+
+    data_map = bulk_fetch_ohlcv(kode_list)
+    candidates = []
+
+    for kode, df in data_map.items():
+        quick = quick_scan(kode, df)
+        if not quick:
+            continue
+            
+        score = quick["technical_score"]
+        vol_surge = quick["kondisi"]["volume"]["rasio"]
+        rsi = quick["kondisi"]["rsi"]["nilai"]
+        
+        # -- SESSION AWARE VOLUME FILTER (v7.5) --
+        curr_hour = datetime.now(config.WIB).hour
+        is_golden = config.SESSION_GOLDEN_START <= curr_hour < config.SESSION_GOLDEN_END
+        is_tokyo = config.SESSION_TOKYO_START <= curr_hour < config.SESSION_TOKYO_END
+        
+        # Jika Sesi Tokyo (Pagi), perketat filter volume krn liquidity rendah/sideways
+        if is_tokyo and not force:
+            if vol_surge < 3.0: 
+                logger.info(f"[AUTOSCALP] 😴 {kode} diabaikan: Volume Tokyo rendah (×{vol_surge:.1f} < 3x)")
+                continue
+
+        # Filter awal
+        if not force:
+            min_score = 65 if is_tokyo else 50 # Tokyo butuh konfirmasi extra
+            if score < min_score or vol_surge < 1.0 or rsi >= 75:
+                continue
+        else:
+            # Force mode: filter lebih longgar
+            if score < 35 or rsi >= 85:
+                continue
+            
+        full_data = full_screening(kode)
+        if not full_data:
+            continue
+            
+        daily_trend_ok = full_data.get("daily_trend", {}).get("uptrend_daily", False)
+        if not force and not daily_trend_ok:
+            continue
+            
+        is_squeeze_break = full_data["kondisi"]["bollinger"]["breakout"]
+        scalp_power = score + (vol_surge * 10) + (20 if is_squeeze_break else 0)
+        
+        # -- SESSION SCORING ADJUSTMENTS (v7.5) --
+        if is_golden:
+            scalp_power += 20
+            logger.info(f"[AUTOSCALP] 🏆 {kode} mendapat Bonus Golden Hour (+20)")
+        elif is_tokyo:
+            scalp_power -= 15 # Penalti Tokyo (False Breakout risk)
+            logger.info(f"[AUTOSCALP] 🐌 {kode} terkena Penalti Sesi Tokyo (-15)")
+            
+        # Jika DXY rally, pair XXXUSD (EURUSD, GBPUSD) biasanya drop
+        if is_dxy_rallying and "USD" in full_data["kode"] and not full_data["kode"].startswith("USD"):
+            scalp_power -= 20
+            
+        # -- RED FOLDER KILL SWITCH (v7.0) --
+        if calendar:
+            base, quote = full_data["kode"][:3], full_data["kode"][3:6]
+            k_base, _ = is_kill_switch_active(calendar, base)
+            k_quote, _ = is_kill_switch_active(calendar, quote)
+            if k_base or k_quote:
+                logger.warning(f"[AUTOSCALP] 🛡 {full_data['kode']} dieliminasi karena Red Folder News.")
+                continue
+
+        full_data["scalp_power"] = scalp_power
+        candidates.append(full_data)
+
+    # v7.5 MAXIMUM EXPOSURE & CORRELATION MANAGER
+    # Mencegah duplikasi mata uang dasar (e.g. jgn EURUSD & EURJPY bersamaan)
+    candidates.sort(key=lambda x: x.get("scalp_power", 0), reverse=True)
+    
+    final_candidates = []
+    used_bases = set()
+    
+    for c in candidates:
+        base = c["kode"][:3]
+        if base in used_bases and not force:
+            continue
+            
+        if force or c["scalp_power"] > 70:
+            final_candidates.append(c)
+            used_bases.add(base)
+            
+        if len(final_candidates) >= 3:
+            break
+    
+    logger.info(f"[AUTOSCALP] ✅ Ditemukan {len(final_candidates)} top class scalping (Exposure Filter Active).")
+    return final_candidates
+
+
