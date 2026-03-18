@@ -1,11 +1,11 @@
 """
-ai_analyzer.py - Groq (Primary) + Gemini (Fallback) dengan Circuit Breaker (v3.0)
-====================================================================================
+ai_analyzer.py - Groq (Primary) + Gemini (Fallback) dengan Circuit Breaker (v8.0 MT5)
+=====================================================================================
 Arsitektur:
   1. Groq LLaMA-3.3-70B (Primary, 30 RPM gratis, < 1 detik)
   2. Gemini 2.0-Flash (Fallback otomatis + Failover 60 menit)
   3. Circuit Breaker: 3 gagal berturut-turut → Groq diblokir 60 menit
-  4. Cache 30 menit per instrumen di SQLite
+  4. Cache 30 menit per instrumen di SQLite (Opsional/Tergantung db_manager)
 """
 
 import json
@@ -33,17 +33,30 @@ logger = logging.getLogger(__name__)
 # ----------------------------------------------------------------
 # CLIENT INITIALIZATION
 # ----------------------------------------------------------------
-_groq_client = None
+_groq_clients: list[Groq] = []
+_active_groq_index = 0
 _gemini_client = None
 
-
 def get_groq_client() -> Groq:
-    global _groq_client
-    if _groq_client is None:
-        if not config.GROQ_API_KEY:
-            raise ValueError("GROQ_API_KEY belum diset di environment variables")
-        _groq_client = Groq(api_key=config.GROQ_API_KEY)
-    return _groq_client
+    global _groq_clients, _active_groq_index
+    if not _groq_clients:
+        if not config.GROQ_API_KEYS:
+            raise ValueError("GROQ_API_KEYS belum diset di environment variables")
+        for key in config.GROQ_API_KEYS:
+            if key.strip():
+                _groq_clients.append(Groq(api_key=key.strip()))
+        if not _groq_clients:
+             raise ValueError("GROQ_API_KEYS kosong/tidak valid")
+    return _groq_clients[_active_groq_index]
+
+def rotate_groq_client() -> bool:
+    """Memutar ke API Key Groq berikutnya jika terdeteksi Token Limit / 429."""
+    global _active_groq_index, _groq_clients
+    if len(_groq_clients) <= 1:
+        return False
+    _active_groq_index = (_active_groq_index + 1) % len(_groq_clients)
+    logger.warning(f"[CIRCUIT] 🔄 Memutar Groq API Key ke antrian #{_active_groq_index + 1}/{len(_groq_clients)}.")
+    return True
 
 
 def get_gemini_client() -> genai.Client:
@@ -55,21 +68,25 @@ def get_gemini_client() -> genai.Client:
     return _gemini_client
 
 
+from typing import Dict, Any
+
 # ----------------------------------------------------------------
 # CIRCUIT BREAKER STATE
 # ----------------------------------------------------------------
-_groq_failure_count: int = 0
-_groq_disabled_until: datetime | None = None
+_circuit_state: Dict[str, Any] = {
+    "groq_failure_count": 0,
+    "groq_disabled_until": None
+}
 _GROQ_FAILURE_THRESHOLD = 3
 _GROQ_COOLDOWN_MINUTES = 60
 
 
 def _is_groq_circuit_open() -> bool:
     """Return True jika Groq sedang dalam kondisi diblokir (circuit open)."""
-    global _groq_disabled_until
-    if _groq_disabled_until is None:
+    disabled_until = _circuit_state["groq_disabled_until"]
+    if disabled_until is None:
         return False
-    if datetime.now() >= _groq_disabled_until:
+    if datetime.now() >= disabled_until: # type: ignore
         # Cooldown selesai — reset circuit
         logger.info("[CIRCUIT] ✅ Groq circuit CLOSED kembali setelah cooldown.")
         _reset_groq_circuit()
@@ -79,113 +96,115 @@ def _is_groq_circuit_open() -> bool:
 
 def _record_groq_failure():
     """Catat satu kegagalan Groq dan buka circuit jika threshold tercapai."""
-    global _groq_failure_count, _groq_disabled_until
-    _groq_failure_count += 1
-    logger.warning(f"[CIRCUIT] ⚡ Groq failure #{_groq_failure_count}/{_GROQ_FAILURE_THRESHOLD}")
-    if _groq_failure_count >= _GROQ_FAILURE_THRESHOLD:
-        _groq_disabled_until = datetime.now() + timedelta(minutes=_GROQ_COOLDOWN_MINUTES)
+    _circuit_state["groq_failure_count"] += 1
+    count = _circuit_state["groq_failure_count"]
+    logger.warning(f"[CIRCUIT] ⚡ Groq failure #{count}/{_GROQ_FAILURE_THRESHOLD}")
+    if count >= _GROQ_FAILURE_THRESHOLD: # type: ignore
+        _circuit_state["groq_disabled_until"] = datetime.now() + timedelta(minutes=_GROQ_COOLDOWN_MINUTES)
         logger.error(
             f"[CIRCUIT] 🔴 Groq circuit OPEN! Diblokir {_GROQ_COOLDOWN_MINUTES} menit "
-            f"hingga {_groq_disabled_until.strftime('%H:%M:%S')}. Semua request → Gemini."
+            f"hingga {_circuit_state['groq_disabled_until'].strftime('%H:%M:%S')}. Semua request → Gemini." # type: ignore
         )
 
 
 def _record_groq_success():
     """Reset failure counter saat Groq berhasil."""
-    global _groq_failure_count
-    if _groq_failure_count > 0:
-        _groq_failure_count = 0
+    if _circuit_state["groq_failure_count"] > 0: # type: ignore
+        _circuit_state["groq_failure_count"] = 0
 
 
 def _reset_groq_circuit():
-    global _groq_failure_count, _groq_disabled_until
-    _groq_failure_count = 0
-    _groq_disabled_until = None
+    _circuit_state["groq_failure_count"] = 0
+    _circuit_state["groq_disabled_until"] = None
 
 
 # ----------------------------------------------------------------
-# SENTIMENT + RECOMMENDATION CACHE (Database Migration v6.0)
+# SENTIMENT + RECOMMENDATION CACHE (DIPINDAHKAN)
 # ----------------------------------------------------------------
-from db_manager import get_cached_sentiment, save_cached_sentiment
+# Operasi database cache dipindahkan ke pemanggil (signal_engine/bot.py)
+# untuk mencegah SQLite database locks & RuntimeError.
 
 
 # ----------------------------------------------------------------
-# PROMPT SISTEM (v3.0 - Ahli Forex & Makro Global)
+# PROMPT SISTEM (v8.0 MT5 Triple Screen)
 # ----------------------------------------------------------------
-SYSTEM_PROMPT = """Kamu adalah analis Forex & Makro Ekonomi Global senior yang ahli dalam pergerakan pasangan mata uang (Major & Cross) serta korelasi instrumen seperti Gold (XAUUSD) dan DXY (Dollar Index).
+TRIPLE_SCREEN_PROMPT = """Kamu adalah Institutional Quant Trader senior untuk Hedge Fund.
+Tugasmu adalah menganalisa sinyal 'Triple Screen' (Alexander Elder) dikombinasikan dengan VWAP harian, dinamika Volume Surge (M1), Support/Resistance, Price Action Candlestick, Korelasi Makro DXY, Smart Money Concepts (FVG), serta berita makro, untuk mengambil keputusan trading skala institusi.
 
-Tugasmu: Analisa gabungan berita + data teknikal untuk menghasilkan rekomendasi trading forex yang akurat.
+ATURAN PENGAMBILAN KEPUTUSAN (STRICT):
+1. Jika H1 Trend BULLISH, kamu HANYA BOLEH mencari peluang LONG (BUY). Entri terbaik adalah ketika harga berada di DISCOUNT (di bawah VWAP M15).
+2. Jika H1 Trend BEARISH, kamu HANYA BOLEH mencari peluang SHORT (SELL). Entri terbaik adalah ketika harga berada di PREMIUM (di atas VWAP M15).
+3. KORELASI DXY (US Dollar Index): Jika DXY STRONG, instrumen yang memiliki USD sebagai arah sebaliknya (seperti XAUUSD / Emas, EURUSD) pasti tertekan turun, DILARANG BUY. Jika DXY WEAK, Emas/EURUSD berpotensi meroket. Evaluasilah korelasi wajar antara jenis instrumen dan DXY.
+4. SMART MONEY CONCEPTS (FVG): Perhatikan area FVG dan Order Block yang unmitigated sebagai magnet harga. Jika terdapat FVG kosong di bawah harga saat ini, hindari melakukan BUY karena harga dapat tersedot turun untuk menutupi gap tersebut (liquidity grab).
+5. Jika H1 SIDEWAYS, kamu WAJIB melihat arah berita (News) dan DXY. Jika News memberikan katalis kuat, kamu boleh melakukan counter-trend trading. Jika News tidak ada atau ambigu, rekomendasikan WAIT (HOLD).
+6. Untuk rekomendasi tingkat "STRONG" (STRONG BUY / STRONG SELL), "Volume Surge Detected" di time-frame M1 adalah SYARAT MUTLAK (Wajib True). Jika False, maksimal rekomendasi hanyalah BUY / SELL biasa.
+7. EXCEPTION untuk aturan 6: Jika terdeteksi pola Price Action pembalikan (seperti BULLISH ENGULFING, HAMMER/PIN BAR) tepat di area "AT SUPPORT" atau menyentuh "ORDER BLOCK BULLISH", kamu BOLEH memberikan STRONG BUY meski Volume Surge False. Sebaliknya untuk BEARISH ENGULFING atau SHOOTING STAR di area "AT RESISTANCE" atau "ORDER BLOCK BEARISH" → STRONG SELL.
 
-ATURAN KETAT:
-- Jawab HANYA dengan format JSON yang valid.
-- 'sentimen' HANYA boleh: "Bullish", "Bearish", atau "Neutral".
-- 'rekomendasi' HANYA boleh: "STRONG BUY", "BUY", "HOLD", "SELL", atau "STRONG SELL".
-- 'alasan_singkat': maksimal 3 kalimat Bahasa Indonesia yang jelas dan actionable.
-- 'skor_keyakinan': angka 1-10.
-- 'faktor_risiko': sebutkan 1-2 risiko utama.
+ATURAN MANAJEMEN POSISI v11.2 (HYPER-AGGRESSIVE SCALPING & REVERSAL EXIT):
+- Kamu kini punya mata untuk melihat "STATUS OPEN POSITIONS SAAT INI" (Jumlah layer dan Total Profit).
+- 🛑 ANTI-HEDGING (STRICT BAN): Jika ada posisi BUY terbuka, kamu HARAM merekomendasikan SELL. Begitupun jika ada posisi SELL terbuka, kamu HARAM merekomendasikan BUY. Mesin akan menge-block tindakanmu jika kamu nekat Hedging.
+- ⚡ EARLY REVERSAL EXIT (PENTING!): Jika kamu sedang memegang posisi (misal BUY), lalu tiba-tiba terdeteksi pola Price Action pembalikan (seperti BEARISH PIN BAR / ENGULFING di M1) atau harga gagal menembus VWAP, JANGAN TUNGGU TREND H1 BERBALIK! Segera keluarkan "CLOSE_ALL_LONG" untuk mengamankan profit sekecil apapun atau memotong loss secepatnya. Begitupun untuk posisi SELL, gunakan "CLOSE_ALL_SHORT".
+- Boleh merekomendasikan "STRONG BUY" meski sudah ada posisi BUY terbuka maksimal 10 Layer (Aggressive Layering). Setara untuk SELL. Target terminal adalah Hit and Run scalping yang cepat.
 
-FORMAT JSON WAJIB (ikuti persis, tidak ada teks di luar JSON):
-{
-  "sentimen": "Bullish",
-  "rekomendasi": "BUY",
-  "alasan_singkat": "Penjelasan 2-3 kalimat yang actionable",
-  "skor_keyakinan": 8,
-  "kata_kunci": ["kata1", "kata2"],
-  "faktor_risiko": "Risiko utama yang perlu diperhatikan"
-}
-
-PANDUAN REKOMENDASI:
-- STRONG BUY: Fundamental sangat positif + teknikal semua hijau
-- BUY: Sentimen positif/neutral + teknikal mendukung
-- HOLD: Sinyal campur atau dirasa masih tunggu konfirmasi  
-- SELL: Berita negatif atau teknikal melemah
-- STRONG SELL: Berita sangat buruk atau teknikal breakdown"""
-
-AUTOSCALP_SYSTEM_PROMPT = """Kamu adalah Prop Trader Forex Kuantitatif spesialis Scalping/Intraday.
-Tugasmu: Diberikan data berita Makro Ekonomi, 1-3 kandidat pair forex, serta Currency Strength Meter (CSM). 
-
-KRITERIA UTAMA PEMILIHAN:
-1. Pilih pair di mana mata uang dasarnya (Base) KUAT dan mata uang pembandingnya (Quote) LEMAH menurut CSM (atau sebaliknya).
-2. Hindari pair yang kedua mata uangnya memiliki skor kekuatan serupa (sideways risk).
-3. Evaluasi pengaruh berita Makro terhadap pasar forex hari ini (Risk On / Risk Off).
+ATURAN OUTPUT:
+- Jawab HANYA dengan format JSON yang valid. Jangan tambahkan teks apa pun di luar JSON.
 
 FORMAT JSON WAJIB:
 {
-  "market_view": "Analisa singkat cuaca market forex (DXY/CSM Bias) hari ini (1 kalimat)",
-  "pemenang_kode": "EURUSD=X",
-  "pemenang_nama": "Euro / US Dollar",
-  "alasan_menang": "Alasan mengapa pair ini dipilih berdasar CSM + Teknikal + News (2 kalimat)",
-  "trading_plan": {
-    "entry_area": "Area harga masuk yang aman",
-    "target_1": "Target take profit awal",
-    "target_2": "Target take profit maksimal",
-    "stop_loss": "Angka cut loss ketat"
-  },
-  "pesan_psikologi": "Satu pesan disiplin singkat untuk trader"
-}"""
+  "arah_trading": "LONG" | "SHORT" | "WAIT" | "CLOSE",
+  "rekomendasi": "STRONG BUY" | "BUY" | "SELL" | "STRONG SELL" | "HOLD" | "CLOSE_ALL_LONG" | "CLOSE_ALL_SHORT",
+  "alasan_singkat": "Maksimal 3 kalimat. Sebutkan konfirmasi H1, DXY, FVG, posisi VWAP M15, dan status Open Positions.",
+  "skor_keyakinan": 8,
+  "faktor_risiko": "Risiko utama dari trade ini"
+}
+"""
 
 
-def _build_prompt(kode: str, headlines: list[str], tech_context: dict | None = None) -> str:
-    numbered = "\n".join(f"{i+1}. {h}" for i, h in enumerate(headlines))
-    ctx = ""
-    if tech_context:
-        score = tech_context.get("technical_score", 0)
-        rsi = tech_context.get("rsi", 0)
-        uptrend = tech_context.get("uptrend_daily", False)
-        bb_squeeze = tech_context.get("bb_squeeze", False)
-        bb_breakout = tech_context.get("bb_breakout", False)
-        ctx = (
-            f"\n\nDATA TEKNIKAL SAAT INI:\n"
-            f"- Technical Score: {score}/100\n"
-            f"- RSI: {rsi:.1f} ({'Oversold' if rsi < 30 else 'Overbought' if rsi > 70 else 'Normal'})\n"
-            f"- Trend Harian: {'📈 UPTREND' if uptrend else '📉 DOWNTREND/SIDEWAYS'}\n"
-            f"- Bollinger Bands: {'🔥 BREAKOUT dari Squeeze!' if bb_breakout else '⚡ SQUEEZE (energi terkumpul)' if bb_squeeze else 'Normal'}\n"
-        )
-
+def _build_triple_screen_prompt(symbol: str, headlines: list[str], ts_data: dict) -> str:
+    """Merakit dictionary eksekutif dari data_fetcher MT5 menjadi string untuk LLM."""
+    numbered_news = "\n".join(f"{i+1}. {h}" for i, h in enumerate(headlines)) if headlines else "Tidak ada berita makro terbaru."
+    
+    # Ekstrak data
+    h1 = ts_data.get("macro_h1", {})
+    m15 = ts_data.get("momentum_m15", {})
+    m1 = ts_data.get("execution_m1", {})
+    
+    fvg = m15.get("fvg_data", {})
+    op = ts_data.get("open_positions", {})
+    tg = ts_data.get("absolute_trend_guard", {})
+    
+    ctx = (
+        f"STATUS OPEN POSITIONS SAAT INI:\n"
+        f"   - Total Layers: {op.get('total_positions', 0)} (Buy: {op.get('total_buy', 0)}, Sell: {op.get('total_sell', 0)})\n"
+        f"   - Total Floating Profit: {op.get('total_profit_pips', 0.0)} pips\n\n"
+        f"ABSOLUTE TREND GUARD (MESIN):\n"
+        f"   - Izin Buka LONG: {'Ya' if tg.get('is_allowed_long', False) else 'TIDAK (DILARANG KERAS)'}\n"
+        f"   - Izin Buka SHORT: {'Ya' if tg.get('is_allowed_short', False) else 'TIDAK (DILARANG KERAS)'}\n\n"
+        f"SIMPULAN DATA KUANTITATIF (MT5 TRIPLE SCREEN):\n"
+        f"1. MACRO TREND (H1):\n"
+        f"   - Trend Status: {h1.get('trend', 'UNKNOWN')}\n"
+        f"   - Synthetic DXY Status: {h1.get('dxy_status', 'UNKNOWN')}\n"
+        f"   - Close Price: {h1.get('close', 'N/A')}\n"
+        f"   - EMA 50 / 200: {h1.get('ema_50', 'N/A')} / {h1.get('ema_200', 'N/A')}\n"
+        f"2. MOMENTUM, VWAP & SMART MONEY (M15):\n"
+        f"   - VWAP Status: {m15.get('vwap_status', 'UNKNOWN')} ({m15.get('vwap_distance_pct', 0)}%)\n"
+        f"   - RSI 14: {m15.get('rsi_14', 'N/A')}\n"
+        f"   - Support M15: {m15.get('support_m15', 'N/A')} | Resistance M15: {m15.get('resistance_m15', 'N/A')}\n"
+        f"   - Posisi thd S/R: {m15.get('sr_status', 'N/A')} (Dist to Support: {m15.get('dist_to_support_pips', 'N/A')} pips, Dist to Resistance: {m15.get('dist_to_resistance_pips', 'N/A')} pips)\n"
+        f"   - Price Action M15: {m15.get('price_action', 'NEUTRAL')}\n"
+        f"   - Unmitigated FVG M15: {fvg.get('fvg_type', 'NONE')} (Top: {fvg.get('fvg_top', 'N/A')}, Bottom: {fvg.get('fvg_bottom', 'N/A')})\n"
+        f"   - Order Block M15: Top: {fvg.get('order_block_top', 'N/A')} | Bottom: {fvg.get('order_block_bottom', 'N/A')}\n"
+        f"3. EXECUTION TRIGGER (M1):\n"
+        f"   - Volume Surge Detected: {m1.get('volume_surge_detected', False)}\n"
+        f"   - Current Tick Vol vs Avg 10: {m1.get('current_tick_volume', 0)} vs {m1.get('average_tick_volume_10', 0)}\n"
+        f"   - Price Action M1: {m1.get('price_action', 'NEUTRAL')}\n\n"
+    )
+    
     return (
-        f"Analisa instrumen {kode} berdasarkan {len(headlines)} headline berita makro/fundamental:{ctx}\n\n"
-        f"HEADLINE BERITA:\n{numbered}\n\n"
-        f"Berikan analisa dan rekomendasi trading dalam format JSON."
+        f"Analisa instrumen {symbol} berdasarkan gabungan data kuantitatif dan headline berita.\n\n"
+        f"{ctx}"
+        f"HEADLINE BERITA:\n{numbered_news}\n\n"
+        f"Sebagai Institutional Quant Trader, tentukan keputusan trading dalam format JSON baku."
     )
 
 
@@ -205,12 +224,12 @@ def _call_groq_api(messages: list, max_tokens: int = 600, response_format: dict 
     Raw Groq API call. Raises specific exceptions untuk retry logic.
     """
     client = get_groq_client()
-    kwargs = dict(
-        model=config.GROQ_MODEL,
-        messages=messages,
-        temperature=0.15,
-        max_tokens=max_tokens,
-    )
+    kwargs = {
+        "model": config.GROQ_MODEL,
+        "messages": messages,
+        "temperature": 0.15,
+        "max_tokens": max_tokens,
+    }
     if response_format:
         kwargs["response_format"] = response_format
 
@@ -220,56 +239,58 @@ def _call_groq_api(messages: list, max_tokens: int = 600, response_format: dict 
 
 @retry(
     retry=retry_if_exception_type(GroqRateLimitError),
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=2, min=3, max=20),
+    stop=stop_after_attempt(5),
+    wait=wait_exponential(multiplier=1, min=1, max=10),
     reraise=False,
 )
 def _groq_with_retry(messages: list, max_tokens: int = 600, response_format: dict | None = None) -> str | None:
-    """Groq call dengan exponential backoff untuk rate limit, max 3 percobaan."""
+    """Groq call dengan rotasi kunci untuk token exhaust / rate limit."""
     try:
         return _call_groq_api(messages, max_tokens, response_format)
     except Exception as e:
         err = str(e).lower()
-        if any(k in err for k in ["rate", "429", "too many", "quota", "tokens"]):
-            logger.warning(f"[CIRCUIT] Groq rate limit, akan retry dengan backoff: {e}")
-            raise GroqRateLimitError(str(e))
-        # Error lain (bukan rate limit) — langsung raise untuk ditangani Circuit Breaker
+        if any(k in err for k in ["rate", "429", "too many", "quota", "tokens", "limit"]):
+            logger.warning(f"[CIRCUIT] Groq token/rate limit error: {e}")
+            if rotate_groq_client():
+                raise GroqRateLimitError(f"Memutar kunci karena: {e}")
+            else:
+                logger.warning("[CIRCUIT] Tidak ada kunci Groq cadangan yang tersisa.")
+                raise GroqRateLimitError(str(e))
+        # Error lain
         raise GroqAPIError(str(e)) from e
 
 
-def _analyze_groq(kode: str, headlines: list[str], tech_ctx: dict | None) -> dict | None:
+def _analyze_mt5_groq(symbol: str, headlines: list[str], ts_data: dict) -> dict | None:
     """
-    Groq inference dengan Circuit Breaker protection.
-    - Circuit OPEN → langsung return None (bypass, tidak ada delay)
-    - Circuit CLOSED → coba Groq, tangani kegagalan, update state
+    Groq inference untuk MT5 Triple Screen.
     """
-    if not config.GROQ_API_KEY:
+    if not config.GROQ_API_KEYS:
         return None
 
     if _is_groq_circuit_open():
-        logger.warning(f"[CIRCUIT] 🔴 Groq circuit OPEN, skip untuk {kode} → Gemini")
+        logger.warning(f"[CIRCUIT] 🔴 Groq circuit OPEN, skip untuk {symbol} → Gemini")
         return None
 
     messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": _build_prompt(kode, headlines, tech_ctx)},
+        {"role": "system", "content": TRIPLE_SCREEN_PROMPT},
+        {"role": "user", "content": _build_triple_screen_prompt(symbol, headlines, ts_data)},
     ]
 
     try:
-        logger.info(f"[AI] 🔵 Groq {config.GROQ_MODEL} → {kode}")
+        logger.info(f"[AI] 🔵 Groq {config.GROQ_MODEL} → {symbol}")
         text = _groq_with_retry(messages, max_tokens=600, response_format={"type": "json_object"})
         if text is None:
             _record_groq_failure()
             return None
-        result = _parse(text)
+        result = _parse_mt5_json(text)
         _record_groq_success()
-        logger.info(f"[AI] ✅ Groq → {kode}: {result['sentimen']} | {result['rekomendasi']} ({result['skor_keyakinan']}/10)")
+        logger.info(f"[AI] ✅ Groq → {symbol}: {result['arah_trading']} | {result['rekomendasi']} ({result['skor_keyakinan']}/10)")
         return result
     except (RetryError, GroqRateLimitError):
-        logger.warning(f"[CIRCUIT] Groq habis retry untuk {kode}")
+        logger.warning(f"[CIRCUIT] Groq habis retry untuk {symbol}")
         _record_groq_failure()
     except Exception as e:
-        logger.error(f"[AI] Groq non-retryable error untuk {kode}: {e}")
+        logger.error(f"[AI] Groq non-retryable error untuk {symbol}: {e}")
         _record_groq_failure()
 
     return None
@@ -278,16 +299,16 @@ def _analyze_groq(kode: str, headlines: list[str], tech_ctx: dict | None) -> dic
 # ----------------------------------------------------------------
 # GEMINI INFERENCE (Fallback)
 # ----------------------------------------------------------------
-def _analyze_gemini(kode: str, headlines: list[str], tech_ctx: dict | None) -> dict | None:
+def _analyze_mt5_gemini(symbol: str, headlines: list[str], ts_data: dict) -> dict | None:
     if not config.GEMINI_API_KEY:
         logger.warning("[AI] GEMINI_API_KEY tidak diset — skip Gemini")
         return None
 
-    full_prompt = f"{SYSTEM_PROMPT}\n\n{_build_prompt(kode, headlines, tech_ctx)}"
+    full_prompt = f"{TRIPLE_SCREEN_PROMPT}\n\n{_build_triple_screen_prompt(symbol, headlines, ts_data)}"
 
-    for attempt in range(1, 3):
+    for attempt in range(1, 4):
         try:
-            logger.info(f"[AI] 🟡 Gemini {config.GEMINI_MODEL} fallback → {kode} (try {attempt})")
+            logger.info(f"[AI] 🟡 Gemini {config.GEMINI_MODEL} fallback → {symbol} (try {attempt})")
             client = get_gemini_client()
             response = client.models.generate_content(
                 model=config.GEMINI_MODEL,
@@ -296,269 +317,137 @@ def _analyze_gemini(kode: str, headlines: list[str], tech_ctx: dict | None) -> d
                     temperature=0.15,
                     top_p=0.8,
                     max_output_tokens=600,
+                    response_mime_type="application/json"
                 ),
             )
-            result = _parse(response.text.strip())
-            logger.info(f"[AI] ✅ Gemini → {kode}: {result['sentimen']} | {result['rekomendasi']}")
+            result = _parse_mt5_json(response.text.strip())
+            logger.info(f"[AI] ✅ Gemini → {symbol}: {result['arah_trading']} | {result['rekomendasi']}")
             return result
 
         except Exception as e:
             err = str(e).lower()
             if any(k in err for k in ["rate", "429", "quota", "resource_exhausted"]):
                 wait = 15 * attempt
-                logger.warning(f"[AI] Gemini rate limit try {attempt}/2, tunggu {wait}s")
+                logger.warning(f"[AI] Gemini rate limit try {attempt}/3, tunggu {wait}s")
                 time.sleep(wait)
             else:
-                logger.error(f"[AI] Gemini error try {attempt}/2: {e}")
+                logger.error(f"[AI] Gemini error try {attempt}/3: {e}")
                 time.sleep(3)
 
     return None
 
 
 # ----------------------------------------------------------------
-# FUNGSI UTAMA
+# FUNGSI UTAMA (MT5 ANALYZER)
 # ----------------------------------------------------------------
-async def analyze_sentiment(
-    kode_saham: str,
+async def analyze_mt5_signal(
+    symbol: str,
     headlines: list[str],
-    tech_context: dict | None = None,
-    max_retry: int = 3,
+    ts_data: dict,
 ) -> dict:
     """
-    Analisa sentimen + rekomendasi trading dengan double-layer AI + SQLite cache (v6.0).
+    Analisa Triple Screen MT5 + Berita menggunakan Double-Layer AI.
+    (Operasi caching dipindah ke fungsi pemanggil di signal_engine/bot.py)
     """
-    kode = kode_saham.upper().replace(".JK", "")
-
-    # 1. Cek cache DB (async)
-    cached = await get_cached_sentiment(kode, config.SENTIMENT_CACHE_TTL_MINUTES)
-    if cached is not None:
-        return {**cached, "dari_cache": True}
-
-    # 2. Tidak ada berita → Neutral
-    if not headlines:
-        logger.warning(f"[AI] Tidak ada berita untuk {kode}")
-        return _neutral_result(kode, len(headlines), reason="no_news")
-
     loop = asyncio.get_event_loop()
 
-    # 3. Groq (primary) - Jalan di Executor
-    result = await loop.run_in_executor(None, _analyze_groq, kode, headlines, tech_context)
+    # 1. Groq (primary) - Jalan di Executor
+    result = await loop.run_in_executor(None, _analyze_mt5_groq, symbol, headlines, ts_data)
 
-    # 4. Gemini (fallback) - Jalan di Executor
+    # 2. Gemini (fallback) - Jalan di Executor
     if result is None:
-        result = await loop.run_in_executor(None, _analyze_gemini, kode, headlines, tech_context)
+        result = await loop.run_in_executor(None, _analyze_mt5_gemini, symbol, headlines, ts_data)
 
-    # 5. Semua gagal
+    # 3. Semua gagal
     if result is None:
-        logger.error(f"[AI] ❌ Semua AI provider gagal untuk {kode}")
-        return _neutral_result(kode, len(headlines), reason="api_error")
+        logger.error(f"[AI] ❌ Semua AI provider gagal untuk {symbol}")
+        result = _mt5_neutral_result(symbol, headlines)
 
     result["headlines_dianalisa"] = len(headlines)
     
-    # 6. Simpan ke Cache DB (async)
-    await save_cached_sentiment(kode, result)
+    if "risk_management" in ts_data:
+        result["risk_management"] = ts_data["risk_management"]
+        result["current_price"] = ts_data.get("current_price")
+    
     return result
 
 
-def _neutral_result(kode: str, n_headlines: int, reason: str = "") -> dict:
-    if reason == "no_news":
-        alasan = "Tidak ada berita terbaru ditemukan. Keputusan berdasarkan teknikal saja."
-    elif reason == "api_error":
-        alasan = "Analisa AI tidak tersedia saat ini. Perhatikan indikator teknikal."
-    else:
-        alasan = "Tidak ada sinyal fundamental yang kuat. Pantau perkembangan berita."
+def _mt5_neutral_result(symbol: str, headlines: list) -> dict:
     return {
-        "sentimen": "Neutral",
+        "arah_trading": "WAIT",
         "rekomendasi": "HOLD",
-        "alasan_singkat": alasan,
-        "skor_keyakinan": 0 if reason == "api_error" else 3,
-        "kata_kunci": [],
-        "faktor_risiko": "Data fundamental tidak tersedia",
-        "headlines_dianalisa": n_headlines,
-    }
-
-
-def is_signal_approved(sentiment_result: dict) -> bool:
-    return sentiment_result.get("sentimen", "Neutral") in ("Bullish", "Neutral")
-
-
-# ----------------------------------------------------------------
-# AUTOSCALPING INFERENCE (v5.0 & v6.0)
-# ----------------------------------------------------------------
-async def analyze_autoscalping(candidates: list[dict], macro_news: list[str], csm_data: dict = None) -> dict | None:
-    """
-    Kirim semua kandidat, berita makro, dan CSM sekaligus ke AI untuk dipilih pemenangnya.
-    """
-    logger.info("[AI_SCALP] Memulai perumusan Trading Plan dengan CSM (Async)...")
-    
-    macro_text = "\n".join(f"- {n}" for n in macro_news) if macro_news else "Tidak ada berita makro terbaru."
-    
-    # Format CSM Data
-    csm_text = ""
-    if csm_data:
-        csm_text = "CURRENCY STRENGTH METER (CSM):\n" + "\n".join([f"- {m}: {val:+.2f}%" for m, val in csm_data.items()])
-    
-    cand_text = ""
-    for c in candidates:
-        kode = c["kode"]
-        harga = c["harga_terakhir"]
-        pct = c["perubahan_pct"]
-        vol = c["kondisi"]["volume"]["rasio"]
-        rsi = c["kondisi"]["rsi"]["nilai"]
-        score = c["technical_score"]
-        bb = "BREAKOUT SQUEEZE" if c["kondisi"]["bollinger"]["breakout"] else "Normal"
-        
-        # Ambil 3 headline berita khusus pair ini
-        from news_scraper import get_news_for_forex
-        stock_news = await get_news_for_forex(kode, max_articles=3)
-        news_str = "\n  - ".join(stock_news) if stock_news else "Tidak ada berita fundamental spesifik instrumen ini."
-        
-        cand_text += f"\nKANDIDAT: {kode} (Harga: {harga:.5f} | Gerak: {pct:.2f}%)\n"
-        cand_text += f"Teknikal: Score {score}/100, RSI {rsi:.1f}, Volume {vol:.1f}x, BB {bb}\n"
-        cand_text += f"Berita:\n  - {news_str}\n"
-
-    user_prompt = (
-        f"{csm_text}\n\n"
-        f"KONDISI MAKRO GLOBAL:\n{macro_text}\n\n"
-        f"DATA KANDIDAT PAIR FOREX:\n{cand_text}\n\n"
-        f"Tugas: Tentukan 1 pemenang terbaik berdasarkan Mismatch Kekuatan Mata Uang (CSM) dan Konfirmasi Teknikal. Output WAJIB JSON."
-    )
-
-    # Coba Groq (dengan circuit breaker)
-    if config.GROQ_API_KEY and not _is_groq_circuit_open():
-        try:
-            messages = [
-                {"role": "system", "content": AUTOSCALP_SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
-            ]
-            logger.info("[AI_SCALP] 🔵 Groq → AutoScalping Trading Plan")
-            text = _groq_with_retry(messages, max_tokens=800, response_format={"type": "json_object"})
-            if text:
-                _record_groq_success()
-                logger.info("[AI_SCALP] ✅ Groq AutoScalping Plan siap.")
-                return json.loads(text)
-            else:
-                _record_groq_failure()
-        except (RetryError, GroqRateLimitError):
-            logger.warning("[CIRCUIT] [AI_SCALP] Groq habis retry untuk AutoScalping")
-            _record_groq_failure()
-        except Exception as e:
-            logger.error(f"[AI_SCALP] Groq error: {e}")
-            _record_groq_failure()
-    elif _is_groq_circuit_open():
-        logger.warning("[CIRCUIT] [AI_SCALP] 🔴 Groq circuit OPEN → langsung Gemini")
-
-    # Coba Gemini fallback
-    if config.GEMINI_API_KEY:
-        try:
-            client = get_gemini_client()
-            full_prompt = f"{AUTOSCALP_SYSTEM_PROMPT}\n\n{user_prompt}"
-            loop = asyncio.get_event_loop()
-            logger.info("[AI_SCALP] 🟡 Gemini fallback → AutoScalping Trading Plan")
-            response = await loop.run_in_executor(None, lambda: client.models.generate_content(
-                model=config.GEMINI_MODEL,
-                contents=full_prompt,
-                config=types.GenerateContentConfig(
-                    temperature=0.2,
-                    top_p=0.8,
-                    max_output_tokens=800,
-                    response_mime_type="application/json"
-                ),
-            ))
-            logger.info("[AI_SCALP] ✅ Gemini AutoScalping Plan siap.")
-            return json.loads(response.text.strip())
-        except Exception as e:
-            logger.error(f"[AI_SCALP] Gemini error: {e}")
-
-    logger.error("[AI_SCALP] ❌ Gagal mendapatkan Trading Plan dari semua AI.")
-    return None
-
-
-# ----------------------------------------------------------------
-# RECOMMENDATION LABEL (Gabungan Score Teknikal + AI)
-# ----------------------------------------------------------------
-def get_final_recommendation(technical_score: int, sentiment_result: dict) -> dict:
-    """
-    Gabungkan score teknikal (0-100) + sentimen AI menjadi rekomendasi final.
-    Teknikal bobot 60%, AI bobot 40%.
-    """
-    sentimen = sentiment_result.get("sentimen", "Neutral")
-    ai_reko = sentiment_result.get("rekomendasi", "HOLD")
-
-    # Konversi sentimen AI ke score numerik
-    sentimen_score = {"Bullish": 100, "Neutral": 50, "Bearish": 0}.get(sentimen, 50)
-
-    # Gabungkan (60% teknikal, 40% AI)
-    final_score = (technical_score * 0.6) + (sentimen_score * 0.4)
-
-    if final_score >= 80 and sentimen == "Bullish":
-        label = "🚀 STRONG BUY"
-        warna = "🟢"
-    elif final_score >= 65:
-        label = "✅ BUY"
-        warna = "🟢"
-    elif final_score >= 45:
-        label = "⏳ HOLD"
-        warna = "🟡"
-    elif final_score >= 25:
-        label = "⚠️ SELL"
-        warna = "🔴"
-    else:
-        label = "🚨 STRONG SELL"
-        warna = "🔴"
-
-    return {
-        "label": label,
-        "warna": warna,
-        "final_score": round(final_score, 1),
-        "ai_rekomendasi": ai_reko,
+        "alasan_singkat": "Analisis AI gagal atau API Limit tercapai. Harap perhatikan data teknikal H1/M15 secara manual.",
+        "skor_keyakinan": 0,
+        "faktor_risiko": "Analisis terputus",
+        "headlines_dianalisa": len(headlines)
     }
 
 
 # ----------------------------------------------------------------
-# JSON PARSER
+# JSON PARSER (MT5 FORMAT)
 # ----------------------------------------------------------------
-def _parse(text: str) -> dict:
+def _parse_mt5_json(text: str) -> dict:
     cleaned = re.sub(r"```(?:json)?\s*", "", text).replace("```", "").strip()
     try:
-        return _validate(json.loads(cleaned))
+        return _validate_mt5_json(json.loads(cleaned))
     except json.JSONDecodeError:
         pass
     m = re.search(r"\{.*?\}", cleaned, re.DOTALL)
     if m:
         try:
-            return _validate(json.loads(m.group()))
+            return _validate_mt5_json(json.loads(m.group()))
         except json.JSONDecodeError:
             pass
+            
+    # Fallback primitif
     tl = text.lower()
-    sentimen = "Bullish" if "bullish" in tl else ("Bearish" if "bearish" in tl else "Neutral")
-    reko = "BUY" if "buy" in tl else ("SELL" if "sell" in tl else "HOLD")
-    return {"sentimen": sentimen, "rekomendasi": reko,
-            "alasan_singkat": "Analisa (text fallback).", "skor_keyakinan": 3,
-            "kata_kunci": [], "faktor_risiko": "Parsing manual"}
+    arah = "LONG" if "long" in tl or "buy" in tl else ("SHORT" if "short" in tl or "sell" in tl else "WAIT")
+    reko = "BUY" if arah == "LONG" else ("SELL" if arah == "SHORT" else "HOLD")
+    return {
+        "arah_trading": arah,
+        "rekomendasi": reko,
+        "alasan_singkat": "Analisa (text fallback karena JSON rusak).",
+        "skor_keyakinan": 3,
+        "faktor_risiko": "Parsing manual"
+    }
 
 
-def _validate(data: dict) -> dict:
-    valid_s = {"Bullish", "Bearish", "Neutral"}
-    valid_r = {"STRONG BUY", "BUY", "HOLD", "SELL", "STRONG SELL"}
-    s = data.get("sentimen", "Neutral")
-    s = next((v for v in valid_s if v.lower() == s.lower()), "Neutral")
+def _validate_mt5_json(data: dict) -> dict:
+    valid_a = {"LONG", "SHORT", "WAIT", "CLOSE"}
+    valid_r = {"STRONG BUY", "BUY", "HOLD", "SELL", "STRONG SELL", "CLOSE_ALL_LONG", "CLOSE_ALL_SHORT"}
+    
+    a = data.get("arah_trading", "WAIT").upper()
+    a = next((v for v in valid_a if v == a), "WAIT")
+    
     r = data.get("rekomendasi", "HOLD").upper()
     r = next((v for v in valid_r if v == r), "HOLD")
+    
     return {
-        "sentimen": s,
+        "arah_trading": a,
         "rekomendasi": r,
         "alasan_singkat": str(data.get("alasan_singkat", "Tidak ada keterangan.")),
         "skor_keyakinan": max(0, min(10, int(data.get("skor_keyakinan", 5)))),
-        "kata_kunci": data.get("kata_kunci", []),
         "faktor_risiko": str(data.get("faktor_risiko", "N/A")),
     }
 
 
+# ----------------------------------------------------------------
+# AUTOSCALPING INFERENCE (Legacy/Placeholder for MT5 CSM later)
+# ----------------------------------------------------------------
+# Note: Dibiarkan agar tidak mematahkan import modul lain jika masih digunakan.
+# Bisa diarahkan ulang/diubah sesuai logika yang sama.
+
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    from news_scraper import get_news_for_forex
-    hasil = asyncio.run(analyze_sentiment("EURUSD=X", ["ECB Keeps Rates Unchanged", "Euro Drops as Dollar Rallies"],
-                               tech_context={"technical_score": 72, "rsi": 45.0, "uptrend_daily": True}))
-    print(f"Sentimen: {hasil['sentimen']} | Reko: {hasil['rekomendasi']} | {hasil['skor_keyakinan']}/10")
-    print(f"Alasan: {hasil['alasan_singkat']}")
+    # Dummy Test Call
+    dummy_ts_data = {
+        "macro_h1": {"trend": "BULLISH", "dxy_status": "DXY STRONG", "close": 1.0850, "ema_50": 1.0840, "ema_200": 1.0800},
+        "momentum_m15": {
+            "vwap_status": "DISCOUNT (Below VWAP)", "vwap_distance_pct": -0.05, "rsi_14": 45,
+            "fvg_data": {"fvg_type": "BEARISH", "fvg_top": 1.0860, "fvg_bottom": 1.0855, "order_block_top": 1.0870, "order_block_bottom": 1.0865}
+        },
+        "execution_m1": {"volume_surge_detected": True, "current_tick_volume": 550, "average_tick_volume_10": 120}
+    }
+    
+    hasil = asyncio.run(analyze_mt5_signal("EURUSD", ["Dollar Melemah karena Data NFP Buruk"], dummy_ts_data))
+    print(json.dumps(hasil, indent=2))

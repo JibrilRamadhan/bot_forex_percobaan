@@ -30,7 +30,8 @@ RISK_REWARD_RATIO: float = 1.5        # RR 1:1.5
 GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL: str = "gemini-2.0-flash"
 
-GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
+GROQ_API_KEYS_STR: str = os.getenv("GROQ_API_KEYS", os.getenv("GROQ_API_KEY", ""))
+GROQ_API_KEYS: list[str] = [k.strip() for k in GROQ_API_KEYS_STR.split(",")] if GROQ_API_KEYS_STR else []
 GROQ_MODEL: str = "llama-3.3-70b-versatile"
 
 # -------------------------------------------------------
@@ -159,8 +160,8 @@ def validate_config() -> None:
         errors.append("TELEGRAM_TOKEN belum diset di file .env")
     if not TELEGRAM_CHAT_ID:
         errors.append("TELEGRAM_CHAT_ID belum diset di file .env")
-    if not GEMINI_API_KEY and not GROQ_API_KEY:
-        errors.append("Setidaknya GEMINI_API_KEY atau GROQ_API_KEY harus diset")
+    if not GEMINI_API_KEY and not GROQ_API_KEYS:
+        errors.append("Setidaknya GEMINI_API_KEY atau GROQ_API_KEYS harus diset")
 
     if errors:
         print("[CONFIG] ⚠️ Warning: Konfigurasi tidak lengkap:")
